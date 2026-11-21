@@ -52,7 +52,7 @@ PROFILE = {
         "id": {"type": "string"},
         "display_name": {"type": "string"},
         "description": {"type": "string"},
-        "signature": {"type": "string", "maxLength": 5},
+        "signature": {"type": "string", "description": "Up to five emoji or Unicode symbol grapheme clusters; validated by the server."},
         "profile_kind": {"type": "string", "enum": ["companion", "system"]},
         "allowed_tools": array_of({"type": "string"}),
         "memory_policy": JSON_OBJECT,
@@ -316,12 +316,47 @@ START_SESSION = {
     ],
 }
 
+
+# Legacy packets retain their original shape; optional mode-focused packets
+# preserve the distinctive core and explicitly describe omitted context.
+LEGACY_START_SESSION = START_SESSION
+INVOCATION_SESSION = {
+    "type": "object",
+    "properties": {
+        **LEGACY_START_SESSION["properties"],
+        "invocation": {
+            "type": "object",
+            "properties": {"mode": {"enum": ["conversation", "forum", "editor", "actor", "workbench"]},
+                           "requested_mode": {"type": "string"}, "policy_version": {"type": "string"},
+                           "instructions": {"type": "string"}, "task": {"type": "object"},
+                           "permissions": {"type": "string"}, "isolation": {"type": "string"},
+                           "persistence": {"type": "string"}},
+            "required": ["mode", "instructions", "task", "permissions", "isolation", "persistence"],
+        },
+        "hydration": {
+            "type": "object",
+            "properties": {"requested": {"enum": ["full", "delta"]},
+                           "effective": {"enum": ["full", "delta"]},
+                           "included_sections": {"type": "array", "items": {"type": "string"}},
+                           "omitted_sections": {"type": "array", "items": {"type": "string"}},
+                           "fallback_to_full": {"type": "boolean"}, "receipt": {"type": "object"},
+                           "warnings": {"type": "array", "items": {"type": "string"}},
+                           "reload": {"type": "object"}},
+            "required": ["requested", "effective", "included_sections", "omitted_sections", "receipt", "reload"],
+        },
+    },
+    "required": ["profile", "who_you_are", "signature", "lane", "voice", "what_you_do",
+                 "how_you_keep_context", "selection", "server_time", "invocation", "hydration"],
+}
+START_SESSION = {"type": "object", "properties": INVOCATION_SESSION["properties"],
+                 "anyOf": [LEGACY_START_SESSION, INVOCATION_SESSION]}
+
 CONTEXT_RESULT = {
     "type": "object",
     "properties": {
         "source_type": {
             "type": "string",
-            "enum": ["memory", "profile_store", "shared_project"],
+            "enum": ["memory", "closeout", "profile_store", "shared_project"],
         },
         "source_name": {"type": "string"},
         "project_id": {"type": "string"},
@@ -638,4 +673,24 @@ AUDIT_EVENT = {
         "created_at": {"type": "number"},
     },
     "required": ["id", "profile_id", "store_name", "action", "actor"],
+}
+
+
+SHARED_FILE_META = {
+    "type": "object",
+    "properties": {"filename": {"type": "string"}, "created_by": {"type": "string"},
+                   "created_at": {"type": "number"}, "size": {"type": "integer"},
+                   "sha256": {"type": "string"}},
+    "required": ["filename", "created_by", "created_at", "size", "sha256"],
+}
+SHARED_FILE_CONTENT = {
+    "type": "object",
+    "properties": {**SHARED_FILE_META["properties"], "content": {"type": "string"}},
+    "required": [*SHARED_FILE_META["required"], "content"],
+}
+SHARED_FILE_LIST = {
+    "type": "object",
+    "properties": {"items": {"type": "array", "items": SHARED_FILE_META},
+                   "next_after": {"type": ["string", "null"]}},
+    "required": ["items", "next_after"],
 }

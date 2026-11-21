@@ -20,8 +20,26 @@ def test_version_negotiation_and_tools(version):
         assert any(t['name'] == 'summon_companion' for t in r.json()['result']['tools'])
         assert r.headers['mcp-protocol-version'] == version
         r = client.get('/mcp', headers={**headers, 'Accept': 'text/event-stream'})
-        assert r.status_code == 200
+        assert r.status_code == 405
+        assert r.headers['allow'] == 'POST'
+        assert r.content == b''
         assert r.headers['mcp-protocol-version'] == version
+        # Declining the optional GET stream must leave normal RPC usable.
+        r = client.post('/mcp', json=_rpc('tools/list'), headers=headers)
+        assert r.status_code == 200
+        assert any(t['name'] == 'summon_companion' for t in r.json()['result']['tools'])
+
+
+@pytest.mark.parametrize('accept', ['text/event-stream', '*/*', 'application/json'])
+def test_standalone_stream_declined_without_bypassing_security(accept):
+    with _mcp_client() as client:
+        headers = {**_bearer(), 'Accept': accept}
+        r = client.get('/mcp', headers=headers)
+        assert r.status_code == 405
+        assert r.headers['allow'] == 'POST'
+        assert r.content == b''
+        assert client.get('/mcp', headers={'Accept': accept}).status_code == 401
+        assert client.get('/mcp', headers={**headers, 'Origin': 'https://evil.example'}).status_code == 403
 
 
 def test_initialize_can_negotiate_an_unsupported_header():

@@ -31,6 +31,8 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.concurrency import run_in_threadpool
 
+from pydantic import ValidationError
+from .invocation import InvocationOptions, input_properties
 from .bridge import ToolBridge, ToolBridgeError
 from .request_limits import (
     RequestBodyTooLarge,
@@ -49,6 +51,7 @@ from .tool_schemas import (
     DYNAMIC_SCHEMA,
     DYNAMIC_STORE,
     FILE_CONTENT,
+    SHARED_FILE_META, SHARED_FILE_CONTENT, SHARED_FILE_LIST,
     FILE_META,
     EXAM_ATTEMPT,
     EXAM_REVIEW,
@@ -285,7 +288,7 @@ def _create_profile_page(values: dict[str, str] | None = None,
 <textarea name="description" rows="3" maxlength="200"
  style="width:100%;padding:8px;margin:4px 0 16px">{_f('description')}</textarea></label>
 <label>Signature (optional, up to 5 characters)<br>
-<input type="text" name="signature" value="{_f('signature')}" maxlength="5"
+<input type="text" name="signature" value="{_f('signature')}"
  style="width:100%;padding:8px;margin:4px 0 16px"></label>
 <label>Who you are (optional — can self-define later)<br>
 <textarea name="who_you_are" rows="4"
@@ -442,6 +445,9 @@ MCP_OUTPUT_SCHEMAS = {
     "send_message": MESSAGE,
     "read_inbox": mcp_items(MESSAGE),
     "set_messages_read_status": mcp_items(MESSAGE),
+    "create_shared_file": SHARED_FILE_META,
+    "list_shared_files": SHARED_FILE_LIST,
+    "read_shared_file": SHARED_FILE_CONTENT,
     "write_file": FILE_META,
     "list_files": mcp_items(FILE_META),
     "read_file": FILE_CONTENT,
@@ -464,7 +470,7 @@ MCP_OUTPUT_SCHEMAS = {
 _READ_ONLY_TOOLS = {
     "resolve_companion", "discover_companions", "summon_companion", "search_memories", "search_context",
     "read_inbox", "list_files", "read_file", "get_ironsworn_resource",
-    "list_stores", "query_records", "get_record",
+    "list_stores", "query_records", "get_record", "list_shared_files", "read_shared_file",
 }
 _OPEN_WORLD_TOOLS = {"send_message"}
 _DESTRUCTIVE_TOOLS = {"forget", "delete_file", "delete_record"}
@@ -500,19 +506,13 @@ MCP_TOOLS = [
         "Call this on your first response in a conversation."
         " Pass the phrase the user supplied. A normalized exact canonical id is"
         " decisive and is tried directly; only a 404 triggers server-side resolution."
-        " The returned selection identifies the active companion. This tool"
+        " The returned selection identifies the companion. Optional modes editor, actor and workbench select task-focused context; secondary means conversation + delta. Delta uses host-declared session.available_sections, keeps identity/voice, and can reload with hydration=full. Modes do not change permissions; actor isolation is narrative only. This tool"
         " returns owner identity, prompts, compact_state, a bounded semantic"
         " memory slice, bounded self-authored soul, and the global companion contract for conversational profiles;"
         " the memory slice has no IDs, tags, or full history. It also returns up to four recent"
         " texture/exchange examples for continuity, and the current server"
         " date/time (server_time, including Madrid time) in one call.",
-        {"profile_id": _PROFILE_ID,
-         "mode": {
-             "type": "string",
-             "enum": ["conversation", "forum"],
-             "default": "conversation",
-             "description": "conversation returns the owner identity; forum omits it and adds bounded thread continuity for autonomous forum wakes.",
-         }},
+        {"profile_id": _PROFILE_ID, **input_properties()},
         ["profile_id"],
     ),
     _tool(
@@ -526,7 +526,7 @@ MCP_TOOLS = [
         {
             "profile_id": _PROFILE_ID,
             "who_you_are": {"type": "string"},
-            "signature": {"type": "string", "description": "Up to five emoji grapheme clusters."},
+            "signature": {"type": "string", "description": "Up to five emoji or Unicode symbol grapheme clusters, including chess pieces (♔ ♕ ♖ ♗ ♘ ♙)."},
             "lane": {"type": "string", "maxLength": 200, "description": "One-line public directory summary."},
             "voice": {"type": "string"},
             "what_you_do": {"type": "string"},
@@ -571,7 +571,7 @@ MCP_TOOLS = [
     _tool(
         "search_context",
         "Search Durable Context",
-        "Search memories, profile stores, and joined shared projects together."
+        "Search memories, historical closeouts, profile stores, and joined shared projects together."
         " Every result is labeled with its source.",
         {
             "profile_id": _PROFILE_ID,
@@ -617,7 +617,7 @@ MCP_TOOLS = [
     _tool(
         "read_inbox",
         "Read Inbox",
-        "Read messages sent to you by other profiles.",
+        "Read messages sent to you by other profiles and atomically mark only the fetched messages read. Unfetched messages stay unread.",
         {
             "profile_id": _PROFILE_ID,
             "unread_only": {"type": "boolean", "default": True},
@@ -628,8 +628,7 @@ MCP_TOOLS = [
     _tool(
         "set_messages_read_status",
         "Set Messages Read Status",
-        "Set the read state for 1–200 of your inbox messages. Set read=true after"
-        " handling messages; use read=false to restore messages to the unread inbox."
+        "Set the read state for 1–200 of your inbox messages. Use read=false to restore messages to the unread inbox."
         " The explicit state is safe to retry.",
         {
             "profile_id": _PROFILE_ID,
@@ -642,6 +641,9 @@ MCP_TOOLS = [
         },
         ["profile_id", "message_ids", "read"],
     ),
+    _tool("create_shared_file", "Create Shared File", "Publish a new UTF-8 file visible to every companion. Create only: existing files cannot be overwritten or deleted, even by their author. Max 256KB; use a new filename for revisions.", {"profile_id": _PROFILE_ID, "filename": {"type": "string"}, "content": {"type": "string"}}, ["profile_id", "filename", "content"]),
+    _tool("list_shared_files", "List Shared Files", "List the shared shelf, visible to every companion. Pass next_after as after for the next page.", {"profile_id": _PROFILE_ID, "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 100}, "after": {"type": "string"}}, ["profile_id"]),
+    _tool("read_shared_file", "Read Shared File", "Read a shared shelf file and its author, creation time and checksum.", {"profile_id": _PROFILE_ID, "filename": {"type": "string"}}, ["profile_id", "filename"]),
     _tool(
         "write_file",
         "Write File",
@@ -1299,14 +1301,27 @@ class MCPToolRunner:
         if name == "discover_companions":
             return self.bridge.list_profiles()
         if name == "summon_companion":
-            mode = arguments.get("mode", "conversation")
-            if not isinstance(mode, str) or mode not in {"conversation", "forum"}:
-                raise ValueError("mode must be 'conversation' or 'forum'")
+            allowed_options = {"mode", "hydration", "session", "task"}
+            if set(arguments) - allowed_options - {"profile_id"}:
+                raise ToolBridgeError(422, "unknown invocation argument")
+            try:
+                options = InvocationOptions.model_validate({k:v for k,v in arguments.items() if k != "profile_id"})
+            except ValidationError as error:
+                details = "; ".join(".".join(map(str, item["loc"])) + ": " + item["msg"]
+                                    for item in error.errors(include_input=False, include_url=False))
+                raise ToolBridgeError(422, "invalid invocation options: " + details) from error
+            mode = options.mode
             forum_mode = mode == "forum"
+            # Leave every existing bare conversation/forum invocation untouched.
+            modern = mode not in {"conversation", "forum"} or bool(set(arguments) & {"hydration", "session", "task"})
+            def load_session(profile_id):
+                if modern:
+                    return self.bridge.start_session(profile_id, options=options.model_dump(exclude_none=True))
+                return self.bridge.start_session(profile_id)
             requested = arguments["profile_id"]
             try:
                 # Canonical ids are decisive and incur no directory lookup.
-                session = self.bridge.start_session(requested)
+                session = load_session(requested)
             except ToolBridgeError as error:
                 if error.status_code != 404:
                     raise
@@ -1316,7 +1331,7 @@ class MCPToolRunner:
                 return self._with_tool_probe_catalog(session)
             resolution = self.bridge.resolve_companion(requested)
             if resolution["status"] == "resolved":
-                session = self.bridge.start_session(resolution["resolved_profile_id"])
+                session = load_session(resolution["resolved_profile_id"])
                 if forum_mode:
                     session = self._with_forum_continuity(session)
                 return self._with_tool_probe_catalog(session)
@@ -1375,6 +1390,14 @@ class MCPToolRunner:
         if name == "set_messages_read_status":
             return self.bridge.set_messages_read_status(
                 arguments["profile_id"], arguments["message_ids"], arguments["read"])
+        if name == "create_shared_file":
+            return self.bridge.create_shared_file(
+                arguments["profile_id"], arguments["filename"], arguments["content"])
+        if name == "list_shared_files":
+            return self.bridge.list_shared_files(arguments["profile_id"],
+                limit=arguments.get("limit", 100), after=arguments.get("after"))
+        if name == "read_shared_file":
+            return self.bridge.read_shared_file(arguments["profile_id"], arguments["filename"])
         if name == "write_file":
             return self.bridge.write_file(
                 arguments["profile_id"], arguments["filename"], arguments["content"])
@@ -1482,6 +1505,10 @@ class MCPToolRunner:
             used_chars += item_chars
             if len(selected) == 12:
                 break
+        if "hydration" in session:
+            delivered = sorted((set(session) - {"hydration"}) | {"identity", "thread_continuity", "thread_continuity_write_contract"})
+            session["hydration"]["included_sections"] = delivered
+            session["hydration"]["receipt"]["delivered_sections"] = delivered
         return {
             **session,
             "identity": None,
@@ -2200,14 +2227,10 @@ def create_mcp_app(
             protocol_error = _protocol_error(request)
             if protocol_error:
                 return protocol_error
-            accept = request.headers.get("accept", "")
-            if "text/event-stream" not in accept and "*/*" not in accept:
-                return Response(status_code=405, headers=headers)
-            return Response(
-                content=": profile-os-mcp connected\n\n",
-                media_type="text/event-stream",
-                headers=headers,
-            )
+            # No standalone server-to-client stream is implemented. Advertising
+            # an empty SSE stream and closing it makes clients reconnect forever.
+            # Streamable HTTP explicitly permits 405 here; POST SSE is separate.
+            return Response(status_code=405, headers={**headers, "Allow": "POST"})
 
         try:
             message = await request.json()

@@ -444,7 +444,7 @@ def test_initialize_and_list_tools(tmp_path, monkeypatch):
     assert r.status_code == 200
     tools = r.json()["result"]["tools"]
     names = {tool["name"] for tool in tools}
-    assert len(names) == 27
+    assert len(names) == 30
     assert {"closeout", "search_memories",
             "set_messages_read_status"} <= names
     assert not names & {"whoami", "resolve_companion", "list_profiles",
@@ -489,7 +489,7 @@ def test_initialize_and_list_tools(tmp_path, monkeypatch):
     ]
     summon = next(tool for tool in tools if tool["name"] == "summon_companion")
     assert "description" not in summon["outputSchema"]["properties"]["profile"]["properties"]
-    assert summon["inputSchema"]["properties"]["mode"]["enum"] == ["conversation", "forum"]
+    assert summon["inputSchema"]["properties"]["mode"]["enum"] == ["conversation", "forum", "editor", "actor", "workbench", "secondary"]
     assert summon["inputSchema"]["properties"]["mode"]["default"] == "conversation"
     assert "one-time code" in closeout["description"]
 
@@ -500,7 +500,7 @@ def test_list_tools_can_omit_output_schemas(tmp_path, monkeypatch):
     r = client.post("/mcp", json=_rpc("tools/list"), headers=_bearer())
     assert r.status_code == 200
     tools = r.json()["result"]["tools"]
-    assert len(tools) == 27
+    assert len(tools) == 30
     for tool in tools:
         assert set(tool) == {"name", "title", "description", "inputSchema", "annotations"}
 
@@ -798,9 +798,8 @@ def test_summon_companion_rejects_an_unknown_mode():
     }).json()["result"]
 
     assert result["isError"] is True
-    assert result["structuredContent"]["error"]["message"] == (
-        "mode must be 'conversation' or 'forum'"
-    )
+    assert "invalid invocation options: mode:" in result["structuredContent"]["error"]["message"]
+    assert "editor" in result["structuredContent"]["error"]["message"]
 
 
 def test_summon_companion_forum_hydrates_bounded_active_continuity_without_identity():
@@ -1012,8 +1011,8 @@ def test_mcp_auth_origin_get_and_token_separation(tmp_path):
         "Origin": ORIGIN,
         "Accept": "text/event-stream",
     })
-    assert r.status_code == 200
-    assert "text/event-stream" in r.headers["content-type"]
+    assert r.status_code == 405
+    assert r.headers["allow"] == "POST"
 
     r = _call_tool(client, "summon_companion", {"profile_id": "tara"})
     assert r.status_code == 200

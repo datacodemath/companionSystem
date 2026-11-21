@@ -21,12 +21,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.routing import APIRoute
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field, field_validator
 from typing import Any
 
+from .shared_files import SharedFiles, SharedFileExists
+from .invocation import InvocationOptions, build_invocation
 from . import seed
 from .access import AccessControl, AccessError
 from .pet_api import create_pet_router
@@ -260,7 +262,7 @@ class PromptEditProposeIn(BaseModel):
 
     @field_validator("signature")
     @classmethod
-    def signature_is_emoji(cls, value: str | None) -> str | None:
+    def signature_is_symbol(cls, value: str | None) -> str | None:
         if value is None:
             return value
         try:
@@ -295,7 +297,7 @@ class DescriptionIn(BaseModel):
 
     @field_validator("signature")
     @classmethod
-    def signature_is_emoji(cls, value: str | None) -> str | None:
+    def signature_is_symbol(cls, value: str | None) -> str | None:
         if value is None:
             return value
         try:
@@ -364,6 +366,7 @@ def create_app(data_dir: str = DATA_DIR, do_seed: bool = True,
     if do_seed:
         seed.seed(store)
     app.state.store = store
+    shared_files = SharedFiles(store)
 
     class CanonicalProfileRoute(APIRoute):
         def get_route_handler(self):
@@ -573,7 +576,7 @@ def create_app(data_dir: str = DATA_DIR, do_seed: bool = True,
         except (ProfileNotFound, DynStoreNotFound, MemoryEventNotFound,
                 MessageNotFound, FileNotFoundInStore) as e:
             raise HTTPException(404, str(e))
-        except DynStoreConflict as e:
+        except (DynStoreConflict, SharedFileExists) as e:
             raise HTTPException(409, str(e))
         except (MalformedMemoryEvent, MalformedRecord, SchemaError, MalformedMessage) as e:
             raise HTTPException(422, str(e))
@@ -908,7 +911,7 @@ def create_app(data_dir: str = DATA_DIR, do_seed: bool = True,
         return _wrap(store.boot, profile_id)
 
     @app.post("/profiles/{profile_id}/session")
-    def start_session(profile_id: str, request: Request):
+    def start_session(profile_id: str, request: Request, options: InvocationOptions | None = None):
         """One-call model hydration packet for a companion's first turn.
 
         It carries semantic context, not database records: the current
@@ -921,6 +924,11 @@ def create_app(data_dir: str = DATA_DIR, do_seed: bool = True,
         if PROFILE_ID_RE.match(normalized_id):
             profile_id = normalized_id
         principal_id = _require("boot", profile_id, request)
+        if options is not None:
+            return _wrap(build_invocation, store, dyn, profile_id, options,
+                         identity_file=identity_file,
+                         can_read_identity=(principal_id is None or access.allowed(principal_id, "identity:read", None)),
+                         can_read_records=(principal_id is None or access.allowed(principal_id, "records:read", profile_id)))
         booted = _wrap(store.boot, profile_id)
         profile = booted["profile"]
         booted["profile"] = {
@@ -1023,6 +1031,12 @@ def create_app(data_dir: str = DATA_DIR, do_seed: bool = True,
             "source_name": "memories",
             "item": item,
         } for item in memories)
+
+        results.extend({
+            "source_type": "closeout",
+            "source_name": "closeouts",
+            "item": item,
+        } for item in _wrap(store.search_closeouts, profile_id, q, limit))
 
         for definition in _wrap(dyn.list, profile_id):
             if definition["status"] not in {"approved", "archived"}:
@@ -1138,6 +1152,13 @@ def create_app(data_dir: str = DATA_DIR, do_seed: bool = True,
         _require("search", profile_id, request)
         return _wrap(store.list_inbox, profile_id, unread_only, limit)
 
+    @app.post("/profiles/{profile_id}/inbox/read")
+    def read_inbox(profile_id: str, request: Request,
+                   unread_only: bool = True, limit: int = Query(50, ge=1, le=200)):
+        """Fetch and atomically mark only returned messages read."""
+        _require("search", profile_id, request)
+        return _wrap(store.read_inbox, profile_id, unread_only, limit)
+
     @app.post("/profiles/{profile_id}/inbox/{message_id}/read")
     def mark_message_read(profile_id: str, message_id: str, request: Request):
         """Legacy one-message endpoint retained for older non-MCP callers."""
@@ -1151,6 +1172,22 @@ def create_app(data_dir: str = DATA_DIR, do_seed: bool = True,
         _require("search", profile_id, request)
         return _wrap(store.set_messages_read_status,
                      profile_id, body.message_ids, body.read)
+
+    @app.post("/profiles/{profile_id}/shared-files/{filename}", status_code=201)
+    def create_shared_file(profile_id: str, filename: str, body: FileWriteIn, request: Request):
+        _require("remember", profile_id, request)
+        return _wrap(shared_files.create, profile_id, filename, body.content)
+
+    @app.get("/profiles/{profile_id}/shared-files")
+    def list_shared_files(profile_id: str, request: Request,
+                          limit: int = Query(100, ge=1, le=200), after: str | None = None):
+        _require("search", profile_id, request)
+        return _wrap(shared_files.list, profile_id, limit, after)
+
+    @app.get("/profiles/{profile_id}/shared-files/{filename}")
+    def read_shared_file(profile_id: str, filename: str, request: Request):
+        _require("search", profile_id, request)
+        return _wrap(shared_files.read, profile_id, filename)
 
     # -- file store: plain files on disk, self-service, never git/DB blob --------
 

@@ -1,5 +1,25 @@
 # Model observations
 
+## 2026-11-21 — Hilo / GPT orchestration, bounded protocol repair
+
+- Independently confirmed the deployed MCP GET branch advertised and immediately
+  closed an empty SSE stream matching Yoga's Antigravity retry report. Applied a
+  small direct protocol edit; no implementation worker or agy model turn used.
+- Preserved newer deployed code by building from its exact pinned image/source;
+  local checkout was older. 49 MCP/OAuth checks and 9 bridge checks passed, plus
+  candidate and public HTTPS protocol matrices and real summon(limo).
+- Server repair accepted; Andrés subsequently tested from Yoga and confirmed
+  Antigravity recovery. Earlier automatic approval review blocked the agent's
+  status command; no bypass. Worker/model tokens and quota usage unknown;
+  no comparative model inference. Review/operations approximately 10 minutes.
+- Routing lesson: verify actual deployed source and distinguish transport
+  acceptance from end-client recovery. Receipt:
+  `ops/agy/2026-11-21-standalone-get/RECEIPT.md`.
+- At Andrés's commit request, recovered the latest owning source modules from
+  both running production images and missing release tests. Preserved newer
+  local regressions; consolidated full suite: 355 passed in 17.04s. Exact
+  selected-source hashes are in the receipt's `production-source.json`.
+
 The client observations below were copied from
 `/home/andres/tamagochi/MODEL_NOTES.md` on 2026-10-17 at Andrés's request.
 Their receipts are relative to that repository; they are Limo's evidence,

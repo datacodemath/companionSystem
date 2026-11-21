@@ -1,5 +1,24 @@
 # Deploy runbook: rumbo.datacodemath.com
 
+## Current pinned release — 2026-11-21
+
+Backend: `profile-os-backend:closeout-search-20261114`; MCP:
+`profile-os-mcp:agy-get-20261121`. Both verified healthy. Antigravity recovery
+confirmed by Andrés from Yoga. This supersedes the historical image pins below.
+
+From `/opt/profile-os`:
+
+```sh
+docker compose -f docker-compose.yml -f releases/closeout-search-20261114/compose.json -f releases/agy-get-20261121/compose.json up -d --no-build --no-deps mcp
+```
+
+For MCP rollback, replace the final override with
+`releases/agy-get-20261121/compose.rollback.json`. Backend remains unchanged.
+The release's `commands.json` preserves exact commands. See the
+[repair and source recovery receipt](ops/agy/2026-11-21-standalone-get/RECEIPT.md).
+The repository now contains the current owning backend and MCP source modules,
+verified against the running containers. No data or identity files were copied.
+
 Gemini registration correction, 2026-10-17: the client registers six callbacks
 across the exact hosts `oauth-redirect.googleusercontent.com`,
 `oauth-redirect-sandbox.googleusercontent.com`, and

@@ -157,21 +157,23 @@ def validate_lane(value: str) -> str:
 
 
 def validate_signature(value: str) -> str:
-    """Allow at most five emoji grapheme clusters, not code points.
+    """Allow at most five emoji or Unicode symbol grapheme clusters.
 
-    ``regex`` supplies Unicode grapheme segmentation (``\\X``) and current
-    emoji properties, which correctly handles ZWJ families, flags, skin tones,
-    and variation selectors without maintaining brittle local ranges.
+    Preserve existing emoji sequences; additionally permit symbol clusters
+    (Unicode category S), including chess, mathematical and arrow glyphs.
+    Text, whitespace and standalone formatting characters remain invalid.
     """
     if not isinstance(value, str):
         raise MalformedRecord("signature must be a string")
     clusters = regex.findall(r"\X", value)
     if len(clusters) > 5:
-        raise MalformedRecord("signature must contain at most five emoji grapheme clusters")
+        raise MalformedRecord("signature must contain at most five emoji or symbol grapheme clusters")
     allowed = regex.compile(r"^[\p{Emoji}\p{Emoji_Modifier}\p{Regional_Indicator}\u200d\ufe0e\ufe0f]+$")
     emoji = regex.compile(r"[\p{Extended_Pictographic}\p{Regional_Indicator}]")
-    if any(not allowed.fullmatch(cluster) or not emoji.search(cluster) for cluster in clusters):
-        raise MalformedRecord("signature must contain emoji only")
+    symbol = regex.compile(r"\p{S}[\p{M}]*")
+    if any(not ((allowed.fullmatch(cluster) and emoji.search(cluster))
+                or symbol.fullmatch(cluster)) for cluster in clusters):
+        raise MalformedRecord("signature must contain emoji or Unicode symbols only")
     return value
 
 
@@ -708,6 +710,24 @@ class Store:
         rows = self.db.execute(sql, params).fetchall()
         return [self._message_dict(r) for r in rows]
 
+    def read_inbox(self, profile_id: str, unread_only: bool = True,
+                   limit: int = 50) -> list[dict]:
+        """Fetch and acknowledge only this batch under one SQLite write lock."""
+        self._require_profile(profile_id)
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 200:
+            raise MalformedMessage("limit must be between 1 and 200")
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            messages = self.list_inbox(profile_id, unread_only, limit)
+            read_at = time.time()
+            for message in messages:
+                if message["read_at"] is None:
+                    self.db.execute(
+                        "UPDATE messages SET read_at=? WHERE id=? AND to_profile_id=?",
+                        (read_at, message["id"], profile_id))
+                    message["read_at"] = read_at
+        return messages
+
     def mark_message_read(self, profile_id: str, message_id: str) -> dict:
         self._require_profile(profile_id)
         row = self.db.execute(
@@ -858,6 +878,33 @@ class Store:
             (profile_id, like, like, limit),
         ).fetchall()
         return [self._event_dict(r) for r in rows]
+
+    def search_closeouts(self, profile_id: str, query: str, limit: int = 20) -> list[dict]:
+        """Search the canonical archive on demand, never through hydration.
+
+        Old rows may only have new_state/notes; migrated legacy session rows
+        live in this same table. The advisory JSONL mirror is not another
+        source of truth and must not create duplicate or resurrected records.
+        """
+        self._require_profile(profile_id)
+        if not isinstance(query, str) or not query.strip():
+            raise MalformedRecord("closeout query must not be empty")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+            raise MalformedRecord("closeout search limit must be between 1 and 100")
+        literal = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like = f"%{literal}%"
+        rows = self.db.execute(
+            "SELECT id, profile_id, facts, texture, exchange, notes, new_state, created_at "
+            "FROM closeouts WHERE profile_id=? AND ("
+            "facts LIKE ? ESCAPE '\\' COLLATE NOCASE OR "
+            "texture LIKE ? ESCAPE '\\' COLLATE NOCASE OR "
+            "exchange LIKE ? ESCAPE '\\' COLLATE NOCASE OR "
+            "notes LIKE ? ESCAPE '\\' COLLATE NOCASE OR "
+            "new_state LIKE ? ESCAPE '\\' COLLATE NOCASE) "
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
+            (profile_id, like, like, like, like, like, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def closeout(self, profile_id: str, facts: str, texture: str, exchange: str,
                  notes: str = "") -> dict:

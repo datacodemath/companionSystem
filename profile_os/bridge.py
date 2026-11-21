@@ -37,6 +37,7 @@ import httpx
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from .sign import sign_request
+from .invocation import input_properties
 from .tool_schemas import (
     APPROVAL,
     AUDIT_EVENT,
@@ -48,6 +49,7 @@ from .tool_schemas import (
     DYNAMIC_RECORD,
     DYNAMIC_STORE,
     FILE_CONTENT,
+    SHARED_FILE_META, SHARED_FILE_CONTENT, SHARED_FILE_LIST,
     FILE_META,
     IDENTITY,
     IRONSWORN_MOVE,
@@ -113,6 +115,9 @@ BRIDGE_OUTPUT_SCHEMAS = {
     "send_message": MESSAGE,
     "read_inbox": array_of(MESSAGE),
     "set_messages_read_status": array_of(MESSAGE),
+    "create_shared_file": SHARED_FILE_META,
+    "list_shared_files": SHARED_FILE_LIST,
+    "read_shared_file": SHARED_FILE_CONTENT,
     "write_file": FILE_META,
     "list_files": array_of(FILE_META),
     "read_file": FILE_CONTENT,
@@ -161,7 +166,7 @@ TOOLS = [
                           " a bounded semantic memory slice (no IDs, tags, or full"
                           " history), and the current server date/time (server_time, including Madrid time)"
                           " in one call.",
-          {"profile_id": _PID}, ["profile_id"]),
+          {"profile_id": _PID, **input_properties()}, ["profile_id"]),
     _tool("propose_prompt_edit", "Propose a change to your own canonical prompt sections."
                                 " Held pending until the human approves it with a live"
                                 " TOTP code from their authenticator app.",
@@ -189,7 +194,7 @@ TOOLS = [
            "query": {"type": "string"},
            "limit": {"type": "integer", "default": 20}},
           ["profile_id", "query"]),
-    _tool("search_context", "Search memories, profile stores, and joined shared"
+    _tool("search_context", "Search memories, historical closeouts, profile stores, and joined shared"
                             " projects in one call. Results identify their source.",
           {"profile_id": _PID, "query": {"type": "string"},
            "limit": {"type": "integer", "default": 20}},
@@ -213,13 +218,13 @@ TOOLS = [
            "to_profile_id": {"type": "string", "description": "recipient profile id"},
            "content": {"type": "string"}},
           ["profile_id", "to_profile_id", "content"]),
-    _tool("read_inbox", "Read messages sent to you by other profiles.",
+    _tool("read_inbox", "Read messages sent to you by other profiles and atomically mark only the fetched messages read. Unfetched messages stay unread.",
           {"profile_id": _PID,
            "unread_only": {"type": "boolean", "default": True},
            "limit": {"type": "integer", "default": 50}},
           ["profile_id"]),
     _tool("set_messages_read_status", "Set the read state for 1–200 of your inbox messages."
-          " Set read=true after handling messages; use read=false to restore them"
+          " Use read=false to restore messages"
           " to the unread inbox. The explicit state is safe to retry.",
           {"profile_id": _PID,
            "message_ids": {"type": "array", "items": {"type": "string"},
@@ -227,6 +232,9 @@ TOOLS = [
                            "description": "Distinct inbox message ids."},
            "read": {"type": "boolean"}},
           ["profile_id", "message_ids", "read"]),
+    _tool("create_shared_file", "Publish a new UTF-8 file visible to every companion. Create only: existing files cannot be overwritten or deleted, even by their author. Max 256KB; use a new filename for revisions.", {"profile_id": _PID, "filename": {"type": "string"}, "content": {"type": "string"}}, ["profile_id", "filename", "content"]),
+    _tool("list_shared_files", "List the shared shelf, visible to every companion. Pass next_after as after for the next page.", {"profile_id": _PID, "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 100}, "after": {"type": "string"}}, ["profile_id"]),
+    _tool("read_shared_file", "Read a shared shelf file and its author, creation time and checksum.", {"profile_id": _PID, "filename": {"type": "string"}}, ["profile_id", "filename"]),
     _tool("write_file", "Write (or overwrite) a plain file in your own scratch file"
                        " store — for scripts, notes, anything that doesn't belong as"
                        " a structured record. Self-service, never in git, never a"
@@ -424,8 +432,14 @@ class ToolBridge:
     def boot(self, profile_id: str):
         return self._request("POST", f"/profiles/{profile_id}/boot")
 
-    def start_session(self, profile_id: str):
-        return self._request("POST", f"/profiles/{profile_id}/session")
+    def start_session(self, profile_id: str, options: dict | None = None, **invocation_options):
+        if invocation_options:
+            if options is not None:
+                raise ValueError("pass options or invocation fields, not both")
+            options = invocation_options
+        if options is None:
+            return self._request("POST", f"/profiles/{profile_id}/session")
+        return self._request("POST", f"/profiles/{profile_id}/session", json=options)
 
     def inspect_session(self, profile_id: str, totp_code: str):
         """TOTP-gated, read-only copy of ``start_session`` for the web inspector."""
@@ -506,7 +520,7 @@ class ToolBridge:
                              json={"to_profile_id": to_profile_id, "content": content})
 
     def read_inbox(self, profile_id: str, unread_only: bool = True, limit: int = 50):
-        return self._request("GET", f"/profiles/{profile_id}/inbox",
+        return self._request("POST", f"/profiles/{profile_id}/inbox/read",
                              params={"unread_only": unread_only, "limit": limit})
 
     def mark_message_read(self, profile_id: str, message_id: str):
@@ -517,6 +531,19 @@ class ToolBridge:
                                  read: bool):
         return self._request("PUT", f"/profiles/{profile_id}/inbox/read-status",
                              json={"message_ids": message_ids, "read": read})
+
+    def create_shared_file(self, profile_id: str, filename: str, content: str):
+        return self._request("POST", f"/profiles/{profile_id}/shared-files/{filename}",
+                             json={"content": content})
+
+    def list_shared_files(self, profile_id: str, limit: int = 100, after: str | None = None):
+        params = {"limit": limit}
+        if after is not None:
+            params["after"] = after
+        return self._request("GET", f"/profiles/{profile_id}/shared-files", params=params)
+
+    def read_shared_file(self, profile_id: str, filename: str):
+        return self._request("GET", f"/profiles/{profile_id}/shared-files/{filename}")
 
     def write_file(self, profile_id: str, filename: str, content: str):
         return self._request("PUT", f"/profiles/{profile_id}/files/{filename}",
