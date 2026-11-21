@@ -134,6 +134,8 @@ def _normalize_task_request(arguments: dict[str, Any]) -> tuple[str, dict[str, A
 
     if "tier" in arguments and arguments["tier"] is not None:
         tier = _string(arguments["tier"], 16).strip().lower()
+        if tier == "medium":
+            tier = "mid"
         if tier not in ("cheap", "mid", "expensive"):
             raise ValueError("Invalid tier")
         payload["tier"] = tier

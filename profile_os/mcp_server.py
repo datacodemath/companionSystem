@@ -888,8 +888,8 @@ QUEUE_MCP_TOOLS = [
             },
             "tier": {
                 "type": "string",
-                "enum": ["cheap", "mid", "expensive"],
-                "description": "Optional routing tier preserved until worker claim.",
+                "enum": ["cheap", "mid", "medium", "expensive"],
+                "description": "Optional routing tier (cheap -> gpt-6-luna / Hydrogen, mid/medium -> gpt-6.2-sol / Neon, expensive -> gpt-6.2-astra / Opus), preserved until worker claim.",
             },
             "codex_fallback_authorized": {
                 "type": "boolean",

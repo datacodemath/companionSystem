@@ -711,6 +711,31 @@ def test_worker_heartbeat_records_liveness_and_enforces_auth(tmp_path):
         assert fetched["worker_heartbeat_at"] == 3_045.5
 
 
+def test_tier_medium_alias_normalizes_to_mid(tmp_path):
+    with _make_client(tmp_path) as client:
+        sub = _call_tool(client, CHAT1_TOKEN, "queue_task", {
+            "request_id": "tier-medium-alias-check",
+            "task": "Verify medium tier alias",
+            "backend": "codex",
+            "tier": "medium",
+        }).json()["result"]
+        assert sub["isError"] is False
+        retry = _call_tool(client, CHAT2_TOKEN, "queue_task", {
+            "request_id": "tier-medium-alias-check",
+            "task": "Verify medium tier alias",
+            "backend": "codex",
+            "tier": "mid",
+        }).json()["result"]
+        assert retry["isError"] is False
+        assert retry["structuredContent"]["job_id"] == sub["structuredContent"]["job_id"]
+        claim = client.post(
+            "/queue/worker/claim",
+            json={"version": 1, "limit": 1},
+            headers={"Authorization": f"Bearer {WORKER_YOGA_TOKEN}"},
+        ).json()["claims"][0]
+        assert claim["request"]["tier"] == "mid"
+
+
 def test_jobqueue_relay_client_end_to_end_round_trip(tmp_path):
     """Exercise actual jobqueue.relay_client.RelayClient + local queue DB
     against the Companions MCP FastAPI app when /home/agent/work is on sys.path."""
