@@ -694,3 +694,57 @@ SHARED_FILE_LIST = {
                    "next_after": {"type": ["string", "null"]}},
     "required": ["items", "next_after"],
 }
+
+INTEGER_OR_NULL: dict[str, Any] = {
+    "anyOf": [{"type": "integer"}, {"type": "null"}],
+}
+
+QUEUE_TASK_SNAPSHOT = {
+    "type": "object",
+    "properties": {
+        "id": {"type": "integer"},
+        "priority": {"type": "integer"},
+        "state": {"type": "string"},
+        "attempts": {"type": "integer"},
+        "result": {},
+        "finished": NUMBER_OR_NULL,
+    },
+    "required": ["id", "priority", "state", "attempts", "result", "finished"],
+}
+
+QUEUE_TASK_RECEIPT = {
+    "type": "object",
+    "properties": {
+        "job_id": {"type": "string"},
+        "request_id": {"type": "string"},
+        "delivery_state": {
+            "type": "string",
+            "enum": ["pending", "leased", "delivered", "delivery_uncertain"],
+        },
+        "state": STRING_OR_NULL,
+        "worker_job_id": INTEGER_OR_NULL,
+        "companion": STRING_OR_NULL,
+        "requester": STRING_OR_NULL,
+        "executor": STRING_OR_NULL,
+        "snapshot": {"anyOf": [QUEUE_TASK_SNAPSHOT, {"type": "null"}]},
+        "receipt": {},
+        "observed_at": NUMBER_OR_NULL,
+        "worker_heartbeat_at": NUMBER_OR_NULL,
+        "stale": {"type": "boolean"},
+    },
+    "required": [
+        "job_id",
+        "request_id",
+        "delivery_state",
+        "state",
+        "worker_job_id",
+        "companion",
+        "requester",
+        "executor",
+        "snapshot",
+        "receipt",
+        "observed_at",
+        "worker_heartbeat_at",
+        "stale",
+    ],
+}

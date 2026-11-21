@@ -34,6 +34,12 @@ from starlette.concurrency import run_in_threadpool
 from pydantic import ValidationError
 from .invocation import InvocationOptions, input_properties
 from .bridge import ToolBridge, ToolBridgeError
+from .queue_relay import (
+    COMPANION_PATTERN as QUEUE_COMPANION_PATTERN,
+    Conflict as QueueConflict,
+    MAX_BODY as QUEUE_MAX_BODY,
+    QueueRelayStore,
+)
 from .request_limits import (
     RequestBodyTooLarge,
     configured_max_request_bytes,
@@ -61,6 +67,7 @@ from .tool_schemas import (
     MEMORY_KINDS,
     MESSAGE,
     PROFILE,
+    QUEUE_TASK_RECEIPT,
     SHARED_DEFS,
     START_SESSION,
     mcp_items,
@@ -464,6 +471,8 @@ MCP_OUTPUT_SCHEMAS = {
     "update_record": DYNAMIC_RECORD,
     "delete_record": DELETED_RECORD,
     "add_records": mcp_items(DYNAMIC_RECORD),
+    "queue_task": QUEUE_TASK_RECEIPT,
+    "get_task": QUEUE_TASK_RECEIPT,
 }
 
 
@@ -471,10 +480,11 @@ _READ_ONLY_TOOLS = {
     "resolve_companion", "discover_companions", "summon_companion", "search_memories", "search_context",
     "read_inbox", "list_files", "read_file", "get_ironsworn_resource",
     "list_stores", "query_records", "get_record", "list_shared_files", "read_shared_file",
+    "get_task",
 }
 _OPEN_WORLD_TOOLS = {"send_message"}
 _DESTRUCTIVE_TOOLS = {"forget", "delete_file", "delete_record"}
-_IDEMPOTENT_TOOLS = {"set_messages_read_status"}
+_IDEMPOTENT_TOOLS = {"set_messages_read_status", "queue_task", "get_task"}
 TOOL_ANNOTATIONS = {
     name: {
         "readOnlyHint": name in _READ_ONLY_TOOLS,
@@ -845,15 +855,205 @@ MCP_TOOLS = [
 
 MCP_TOOL_NAMES = {tool["name"] for tool in MCP_TOOLS}
 
+QUEUE_MCP_TOOLS = [
+    _tool(
+        "queue_task",
+        "Queue Task",
+        "Submit a durable task to the worker queue and receive a stable job ID. "
+        "Supply a stable request_id so retries deduplicate without creating a second job. "
+        "Access is governed by the authenticated caller; companion/requester/executor fields "
+        "are attribution labels only.",
+        {
+            "request_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "description": "Stable caller-generated idempotency key (1 to 128 characters).",
+            },
+            "task": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 16384,
+                "description": "Nonblank task instructions (1 to 16,384 UTF-8 bytes).",
+            },
+            "backend": {
+                "type": "string",
+                "enum": ["codex", "agy", "auto"],
+                "default": "codex",
+                "description": "Target local worker execution backend.",
+            },
+            "model": {
+                "anyOf": [{"type": "string", "maxLength": 128}, {"type": "null"}],
+                "description": "Optional concrete model pin (up to 128 characters).",
+            },
+            "tier": {
+                "type": "string",
+                "enum": ["cheap", "mid", "expensive"],
+                "description": "Optional routing tier preserved until worker claim.",
+            },
+            "codex_fallback_authorized": {
+                "type": "boolean",
+                "default": False,
+                "description": "Whether fallback to Codex is explicitly authorized under auto routing.",
+            },
+            "priority": {
+                "type": "integer",
+                "minimum": -100,
+                "maximum": 100,
+                "default": 0,
+                "description": "Scheduling priority from -100 to 100.",
+            },
+            "effort": {
+                "type": "string",
+                "enum": ["low", "medium", "high", "xhigh", "max"],
+                "description": "Optional Codex reasoning effort level.",
+            },
+            "companion": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": QUEUE_COMPANION_PATTERN.pattern,
+                "description": "Optional companion attribution label (audit metadata only).",
+            },
+            "requester": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": QUEUE_COMPANION_PATTERN.pattern,
+                "description": "Optional requesting companion label (attribution metadata only).",
+            },
+            "executor": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": QUEUE_COMPANION_PATTERN.pattern,
+                "description": "Optional executing companion label (attribution metadata only).",
+            },
+            "task_kind": {
+                "type": "string",
+                "enum": ["implementation", "review", "research", "maintenance", "general"],
+                "description": "Optional task category.",
+            },
+            "delegation_mode": {
+                "type": "string",
+                "enum": ["queue_only"],
+                "default": "queue_only",
+                "description": "Delegation mode; only queue_only is supported.",
+            },
+        },
+        ["request_id", "task"],
+    ),
+    _tool(
+        "get_task",
+        "Get Task",
+        "Retrieve the delivery status, observed execution state, attribution metadata, "
+        "and saved receipt for a queued task owned by the authenticated caller. "
+        "Pass job_id, request_id, or both.",
+        {
+            "job_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "description": "Stable queue job ID returned by queue_task.",
+            },
+            "request_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "description": "Caller-supplied request ID used with queue_task.",
+            },
+        },
+        [],
+    ),
+]
 
-def _advertised_tools() -> list[dict[str, Any]]:
+QUEUE_MCP_TOOL_NAMES = {tool["name"] for tool in QUEUE_MCP_TOOLS}
+
+
+def _advertised_tools(*, include_queue_tools: bool = False) -> list[dict[str, Any]]:
     # ChatGPT's connector setup rejects the full tool list when it cannot
     # validate an output schema.  Keep discovery reliably available by
     # default; operators with a host that supports output schemas can opt in
     # with MCP_OMIT_OUTPUT_SCHEMAS=0.
+    tools = MCP_TOOLS + QUEUE_MCP_TOOLS if include_queue_tools else MCP_TOOLS
     if os.environ.get("MCP_OMIT_OUTPUT_SCHEMAS", "1") == "0":
-        return MCP_TOOLS
-    return [{k: v for k, v in tool.items() if k != "outputSchema"} for tool in MCP_TOOLS]
+        return tools
+    return [{k: v for k, v in tool.items() if k != "outputSchema"} for tool in tools]
+
+
+@dataclass(frozen=True)
+class QueueCallerBinding:
+    token: str
+    owner: str
+    route: str
+    label: str = ""
+
+
+@dataclass(frozen=True)
+class QueueWorkerBinding:
+    token: str
+    route: str
+    worker_id: str = "worker"
+
+
+@dataclass(frozen=True)
+class AuthenticatedCaller:
+    principal_id: str
+    auth_method: str
+    session_id: str | None = None
+    queue_authorized: bool = False
+    queue_route: str | None = None
+
+
+def _parse_queue_callers_env(raw: str | None) -> list[QueueCallerBinding]:
+    if not raw:
+        return []
+    parsed = json.loads(raw)
+    if not isinstance(parsed, list):
+        raise ValueError("MCP_QUEUE_CALLERS_JSON must be a JSON array")
+    bindings: list[QueueCallerBinding] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            raise ValueError("Each queue caller entry must be an object")
+        token = str(item.get("token") or "")
+        owner = str(item.get("owner") or "")
+        route = str(item.get("route") or "")
+        label = str(item.get("label") or "")
+        if not token or not owner or not route:
+            raise ValueError("Queue caller entry requires non-empty token, owner, and route")
+        bindings.append(QueueCallerBinding(token=token, owner=owner, route=route, label=label))
+    return bindings
+
+
+def _parse_queue_workers_env(
+    raw: str | None,
+    single_token: str | None,
+    single_route: str | None,
+    single_id: str | None,
+) -> list[QueueWorkerBinding]:
+    bindings: list[QueueWorkerBinding] = []
+    if raw:
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list):
+            raise ValueError("MCP_QUEUE_WORKERS_JSON must be a JSON array")
+        for item in parsed:
+            if not isinstance(item, dict):
+                raise ValueError("Each queue worker entry must be an object")
+            token = str(item.get("token") or "")
+            route = str(item.get("route") or "")
+            worker_id = str(item.get("worker_id") or "worker")
+            if not token or not route:
+                raise ValueError("Queue worker entry requires non-empty token and route")
+            bindings.append(QueueWorkerBinding(token=token, route=route, worker_id=worker_id))
+    if single_token:
+        if not single_route:
+            raise ValueError("MCP_QUEUE_WORKER_ROUTE or MCP_QUEUE_DEFAULT_ROUTE is required with MCP_QUEUE_WORKER_TOKEN")
+        bindings.append(QueueWorkerBinding(
+            token=single_token,
+            route=single_route,
+            worker_id=single_id or "yoga-worker",
+        ))
+    return bindings
 
 
 @dataclass
@@ -877,6 +1077,17 @@ class MCPSettings:
         "claude.ai",
         "*.claude.ai",
     ])
+    # Authenticated Queue API configuration (fail-closed by default).
+    queue_db_path: str | None = None
+    queue_default_route: str | None = None
+    queue_oauth_owner: str | None = None
+    queue_oauth_allowed_clients: list[str] = field(default_factory=list)
+    queue_connector_owner: str | None = None
+    queue_callers: list[QueueCallerBinding] = field(default_factory=list)
+    queue_workers: list[QueueWorkerBinding] = field(default_factory=list)
+    queue_lease_seconds: float = 60.0
+    queue_stale_seconds: float = 120.0
+    queue_worker_rate_limit_per_minute: int = 120
 
     @classmethod
     def from_env(cls) -> "MCPSettings":
@@ -889,6 +1100,10 @@ class MCPSettings:
         redirect_hosts = _split_csv(os.environ.get("MCP_OAUTH_ALLOWED_REDIRECT_HOSTS"))
         if not redirect_hosts:
             redirect_hosts = ["claude.ai", "*.claude.ai", "127.0.0.1", "localhost"]
+        queue_default_route = os.environ.get("MCP_QUEUE_DEFAULT_ROUTE") or None
+        queue_lease_raw = os.environ.get("MCP_QUEUE_LEASE_SECONDS")
+        queue_stale_raw = os.environ.get("MCP_QUEUE_STALE_SECONDS")
+        queue_rate_raw = os.environ.get("MCP_QUEUE_WORKER_RATE_LIMIT_PER_MINUTE")
         return cls(
             auth_required=_env_bool("MCP_AUTH_REQUIRED", True),
             connector_tokens=tokens,
@@ -914,6 +1129,23 @@ class MCPSettings:
             ),
             oauth_token_ttl_seconds=ttl,
             oauth_allowed_redirect_hosts=redirect_hosts,
+            queue_db_path=os.environ.get("MCP_QUEUE_DB_PATH") or None,
+            queue_default_route=queue_default_route,
+            queue_oauth_owner=os.environ.get("MCP_QUEUE_OAUTH_OWNER") or None,
+            queue_oauth_allowed_clients=_split_csv(
+                os.environ.get("MCP_QUEUE_OAUTH_ALLOWED_CLIENTS")
+            ),
+            queue_connector_owner=os.environ.get("MCP_QUEUE_CONNECTOR_OWNER") or None,
+            queue_callers=_parse_queue_callers_env(os.environ.get("MCP_QUEUE_CALLERS_JSON")),
+            queue_workers=_parse_queue_workers_env(
+                os.environ.get("MCP_QUEUE_WORKERS_JSON"),
+                os.environ.get("MCP_QUEUE_WORKER_TOKEN"),
+                os.environ.get("MCP_QUEUE_WORKER_ROUTE") or queue_default_route,
+                os.environ.get("MCP_QUEUE_WORKER_ID"),
+            ),
+            queue_lease_seconds=float(queue_lease_raw) if queue_lease_raw else 60.0,
+            queue_stale_seconds=float(queue_stale_raw) if queue_stale_raw else 120.0,
+            queue_worker_rate_limit_per_minute=int(queue_rate_raw) if queue_rate_raw else 120,
         )
 
 
@@ -1599,13 +1831,13 @@ def _tool_result(value: Any) -> dict[str, Any]:
     return result
 
 
-def _tool_error(message: str) -> dict[str, Any]:
+def _tool_error(message: str, status: int | None = None) -> dict[str, Any]:
     return {
         "content": [{"type": "text", "text": message}],
         "isError": True,
         # Error results deliberately do not conform to a tool's successful
         # outputSchema; clients can rely on this common envelope instead.
-        "structuredContent": {"error": {"message": message, "status": None}},
+        "structuredContent": {"error": {"message": message, "status": status}},
     }
 
 
@@ -1679,51 +1911,180 @@ def _validate_oauth_token(
     settings: MCPSettings,
     request: Request,
     token: str,
-) -> bool:
+) -> dict[str, Any] | None:
     parts = token.split(".")
     if len(parts) != 4 or parts[0] != "pos" or parts[1] != "v1":
-        return False
+        return None
     encoded, sig = parts[2], parts[3]
     expected = hmac.new(settings.oauth_signing_key.encode("utf-8"),
                         encoded.encode("ascii"), hashlib.sha256).digest()
     try:
         supplied = _b64url_decode(sig)
     except (ValueError, TypeError):
-        return False
+        return None
     if not hmac.compare_digest(expected, supplied):
-        return False
+        return None
     try:
         payload = json.loads(_b64url_decode(encoded).decode("utf-8"))
     except (ValueError, TypeError, json.JSONDecodeError):
-        return False
+        return None
     now = int(time.time())
     if int(payload.get("exp", 0)) <= now:
-        return False
-    if payload.get("iss") != _issuer_url(settings, request):
-        return False
-    if payload.get("aud") != _resource_url(settings, request):
-        return False
-    scope = str(payload.get("scope", ""))
-    return SCOPE in scope.split()
-
-
-def _authenticated(settings: MCPSettings, request: Request) -> JSONResponse | None:
-    if not settings.auth_required:
         return None
+    if payload.get("iss") != _issuer_url(settings, request):
+        return None
+    if payload.get("aud") != _resource_url(settings, request):
+        return None
+    scope = str(payload.get("scope", ""))
+    if SCOPE not in scope.split():
+        return None
+    return payload
+
+
+def _match_worker(settings: MCPSettings, token: str) -> QueueWorkerBinding | None:
+    matched: QueueWorkerBinding | None = None
+    for worker in settings.queue_workers:
+        if hmac.compare_digest(token, worker.token):
+            matched = worker
+    return matched
+
+
+def _match_queue_caller(settings: MCPSettings, token: str) -> tuple[int, QueueCallerBinding] | None:
+    matched: tuple[int, QueueCallerBinding] | None = None
+    for idx, caller in enumerate(settings.queue_callers):
+        if hmac.compare_digest(token, caller.token):
+            matched = (idx, caller)
+    return matched
+
+
+def _match_connector_token(settings: MCPSettings, token: str) -> int | None:
+    matched: int | None = None
+    for idx, expected in enumerate(settings.connector_tokens):
+        if hmac.compare_digest(token, expected):
+            matched = idx
+    return matched
+
+
+def _authenticate_mcp_caller(
+    settings: MCPSettings,
+    request: Request,
+) -> tuple[JSONResponse | None, AuthenticatedCaller | None]:
+    if not settings.auth_required:
+        return None, AuthenticatedCaller(
+            principal_id="anonymous",
+            auth_method="unauthenticated",
+            session_id=None,
+            queue_authorized=False,
+            queue_route=None,
+        )
     header = request.headers.get("authorization") or ""
     if not header.startswith("Bearer "):
         LOGGER.warning("mcp 401: no bearer header (%s %s)",
                        request.method, request.url.path)
-        return _unauthorized(settings, request)
+        return _unauthorized(settings, request), None
     token = header[len("Bearer "):]
-    for expected in settings.connector_tokens:
-        if hmac.compare_digest(token, expected):
-            return None
-    if _validate_oauth_token(settings, request, token):
-        return None
+    worker = _match_worker(settings, token)
+    if worker is not None:
+        LOGGER.warning(
+            "mcp 403: worker credential rejected on owner endpoint route=%s worker_id=%s",
+            worker.route, worker.worker_id,
+        )
+        return JSONResponse({"error": "forbidden"}, status_code=403), None
+    caller_match = _match_queue_caller(settings, token)
+    if caller_match is not None:
+        idx, binding = caller_match
+        return None, AuthenticatedCaller(
+            principal_id=binding.owner,
+            auth_method="queue_caller_token",
+            session_id=binding.label or f"caller:{idx}",
+            queue_authorized=True,
+            queue_route=binding.route,
+        )
+    connector_idx = _match_connector_token(settings, token)
+    if connector_idx is not None:
+        queue_ok = bool(settings.queue_connector_owner and settings.queue_default_route)
+        return None, AuthenticatedCaller(
+            principal_id=settings.queue_connector_owner or "connector",
+            auth_method="connector_token",
+            session_id=f"connector:{connector_idx}",
+            queue_authorized=queue_ok,
+            queue_route=settings.queue_default_route if queue_ok else None,
+        )
+    oauth_payload = _validate_oauth_token(settings, request, token)
+    if oauth_payload is not None:
+        client_id = str(oauth_payload.get("client_id") or "")
+        client_allowed = (
+            not settings.queue_oauth_allowed_clients
+            or client_id in settings.queue_oauth_allowed_clients
+        )
+        queue_ok = bool(
+            settings.queue_oauth_owner
+            and settings.queue_default_route
+            and client_allowed
+        )
+        return None, AuthenticatedCaller(
+            principal_id=settings.queue_oauth_owner or f"client:{client_id}",
+            auth_method="oauth",
+            session_id=client_id or None,
+            queue_authorized=queue_ok,
+            queue_route=settings.queue_default_route if queue_ok else None,
+        )
     LOGGER.warning("mcp 401: bearer token rejected (%s %s)",
                    request.method, request.url.path)
-    return _unauthorized(settings, request, "invalid_token")
+    return _unauthorized(settings, request, "invalid_token"), None
+
+
+def _authenticated(settings: MCPSettings, request: Request) -> JSONResponse | None:
+    error, _ = _authenticate_mcp_caller(settings, request)
+    return error
+
+
+def _authenticate_worker(
+    settings: MCPSettings,
+    request: Request,
+) -> tuple[JSONResponse | None, QueueWorkerBinding | None]:
+    header = request.headers.get("authorization") or ""
+    if not header.startswith("Bearer "):
+        LOGGER.warning("worker 401: no bearer header (%s %s)",
+                       request.method, request.url.path)
+        return JSONResponse(
+            {"error": "unauthorized"},
+            status_code=401,
+            headers={"WWW-Authenticate": "Bearer"},
+        ), None
+    token = header[len("Bearer "):]
+    worker = _match_worker(settings, token)
+    if worker is not None:
+        return None, worker
+    if (
+        _match_queue_caller(settings, token) is not None
+        or _match_connector_token(settings, token) is not None
+        or _validate_oauth_token(settings, request, token) is not None
+    ):
+        LOGGER.warning("worker 403: owner credential rejected on worker endpoint (%s %s)",
+                       request.method, request.url.path)
+        return JSONResponse({"error": "forbidden"}, status_code=403), None
+    LOGGER.warning("worker 401: bearer token rejected (%s %s)",
+                   request.method, request.url.path)
+    return JSONResponse(
+        {"error": "unauthorized"},
+        status_code=401,
+        headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
+    ), None
+
+
+def _validate_queue_credentials(settings: MCPSettings) -> None:
+    owner_tokens = [
+        *settings.connector_tokens,
+        *(binding.token for binding in settings.queue_callers),
+    ]
+    for idx, worker in enumerate(settings.queue_workers):
+        for owner_token in owner_tokens:
+            if hmac.compare_digest(worker.token, owner_token):
+                raise ValueError("Worker and owner credentials must be distinct")
+        for other in settings.queue_workers[idx + 1:]:
+            if hmac.compare_digest(worker.token, other.token):
+                raise ValueError("Worker credentials must be distinct")
 
 
 def _preflight_headers(settings: MCPSettings, request: Request) -> dict[str, str]:
@@ -1752,10 +2113,21 @@ def _safe_profile(arguments: dict[str, Any]) -> str:
     return str(value) if value is not None else "-"
 
 
-def _handle_rpc(message: dict[str, Any], app: FastAPI) -> dict[str, Any]:
+def _handle_rpc(
+    message: dict[str, Any],
+    app: FastAPI,
+    caller: AuthenticatedCaller | None = None,
+) -> dict[str, Any]:
     request_id = message.get("id")
     method = message.get("method")
     params = message.get("params") or {}
+    verified_caller = caller or AuthenticatedCaller(
+        principal_id="anonymous",
+        auth_method="unauthenticated",
+        session_id=None,
+        queue_authorized=False,
+        queue_route=None,
+    )
 
     if method == "initialize":
         requested = params.get("protocolVersion")
@@ -1786,17 +2158,84 @@ def _handle_rpc(message: dict[str, Any], app: FastAPI) -> dict[str, Any]:
         return _rpc_result(request_id, {})
 
     if method == "tools/list":
-        return _rpc_result(request_id, {"tools": _advertised_tools()})
+        include_queue = bool(
+            app.state.queue_store is not None
+            and verified_caller.queue_authorized
+            and verified_caller.queue_route
+        )
+        return _rpc_result(
+            request_id,
+            {"tools": _advertised_tools(include_queue_tools=include_queue)},
+        )
 
     if method == "tools/call":
         if not isinstance(params, dict):
             return _rpc_error(request_id, -32602, "tools/call params must be an object")
         name = params.get("name")
         arguments = params.get("arguments") or {}
-        if name not in MCP_TOOL_NAMES:
+        if name not in MCP_TOOL_NAMES and name not in QUEUE_MCP_TOOL_NAMES:
             return _rpc_error(request_id, -32602, f"unknown tool {name!r}")
         if not isinstance(arguments, dict):
             return _rpc_error(request_id, -32602, "tool arguments must be an object")
+
+        if name in QUEUE_MCP_TOOL_NAMES:
+            started = time.time()
+            queue_store: QueueRelayStore | None = app.state.queue_store
+            if (
+                queue_store is None
+                or not verified_caller.queue_authorized
+                or not verified_caller.queue_route
+            ):
+                elapsed_ms = int((time.time() - started) * 1000)
+                LOGGER.warning(
+                    "mcp_queue_call name=%s principal=%s session=%s outcome=forbidden elapsed_ms=%s",
+                    name, verified_caller.principal_id, verified_caller.session_id or "-", elapsed_ms,
+                )
+                return _rpc_result(
+                    request_id,
+                    _tool_error("caller is not authorized for queue access", 403),
+                )
+            try:
+                value = queue_store.principal(
+                    verified_caller.principal_id,
+                    verified_caller.queue_route,
+                    name,
+                    arguments,
+                )
+                elapsed_ms = int((time.time() - started) * 1000)
+                LOGGER.info(
+                    "mcp_queue_call name=%s principal=%s session=%s job_id=%s request_id=%s delivery_state=%s state=%s outcome=ok elapsed_ms=%s",
+                    name,
+                    verified_caller.principal_id,
+                    verified_caller.session_id or "-",
+                    value["job_id"],
+                    value["request_id"],
+                    value["delivery_state"],
+                    value["state"] or "-",
+                    elapsed_ms,
+                )
+                return _rpc_result(request_id, _tool_result(value))
+            except QueueConflict as e:
+                elapsed_ms = int((time.time() - started) * 1000)
+                LOGGER.warning(
+                    "mcp_queue_call name=%s principal=%s session=%s outcome=conflict elapsed_ms=%s",
+                    name, verified_caller.principal_id, verified_caller.session_id or "-", elapsed_ms,
+                )
+                return _rpc_result(request_id, _tool_error(str(e), 409))
+            except LookupError as e:
+                elapsed_ms = int((time.time() - started) * 1000)
+                LOGGER.warning(
+                    "mcp_queue_call name=%s principal=%s session=%s outcome=not_found elapsed_ms=%s",
+                    name, verified_caller.principal_id, verified_caller.session_id or "-", elapsed_ms,
+                )
+                return _rpc_result(request_id, _tool_error(str(e), 404))
+            except (KeyError, TypeError, ValueError) as e:
+                elapsed_ms = int((time.time() - started) * 1000)
+                LOGGER.warning(
+                    "mcp_queue_call name=%s principal=%s session=%s outcome=bad_args elapsed_ms=%s",
+                    name, verified_caller.principal_id, verified_caller.session_id or "-", elapsed_ms,
+                )
+                return _rpc_result(request_id, _tool_error(str(e), 400))
 
         started = time.time()
         profile_id = _safe_profile(arguments)
@@ -1823,9 +2262,7 @@ def _handle_rpc(message: dict[str, Any], app: FastAPI) -> dict[str, Any]:
             )
             return _rpc_result(
                 request_id,
-                {**_tool_error(f"backend returned {e.status_code}: {e.detail}"),
-                 "structuredContent": {"error": {"message": f"backend returned {e.status_code}: {e.detail}",
-                                                   "status": e.status_code}}},
+                _tool_error(f"backend returned {e.status_code}: {e.detail}", e.status_code),
             )
         except (KeyError, TypeError, ValueError) as e:
             elapsed_ms = int((time.time() - started) * 1000)
@@ -1844,8 +2281,11 @@ def create_mcp_app(
     settings: MCPSettings | None = None,
     oauth_state: OAuthState | None = None,
     admin_verify: AdminVerifyFn | None = None,
+    queue_store: QueueRelayStore | None = None,
+    queue_clock: Callable[[], float] | None = None,
 ) -> FastAPI:
     settings = settings or MCPSettings.from_env()
+    _validate_queue_credentials(settings)
     app = FastAPI(title="Profile OS Remote MCP", version=SERVER_VERSION)
     app.state.settings = settings
     app.state.oauth = oauth_state or OAuthState(
@@ -1857,6 +2297,17 @@ def create_mcp_app(
         closeout_signing_key=settings.closeout_signing_key or settings.oauth_signing_key,
         closeout_code_state=CloseoutCodeState(closeout_state_file),
     )
+    if queue_store is not None:
+        app.state.queue_store = queue_store
+    elif settings.queue_db_path:
+        app.state.queue_store = QueueRelayStore(
+            settings.queue_db_path,
+            lease_seconds=settings.queue_lease_seconds,
+            stale_seconds=settings.queue_stale_seconds,
+            clock=queue_clock or time.time,
+        )
+    else:
+        app.state.queue_store = None
     app.state.admin_verify = admin_verify or default_admin_verify
     _max_request_bytes = configured_max_request_bytes()
     _authorize_hits: dict[str, list[float]] = {}
@@ -1864,6 +2315,7 @@ def create_mcp_app(
     _create_profile_hits: dict[str, list[float]] = {}
     _session_inspector_hits: dict[str, list[float]] = {}
     _oauth_register_hits: dict[str, list[float]] = {}
+    _worker_hits: dict[str, list[float]] = {}
 
     @app.middleware("http")
     async def _bounded_body(request: Request, call_next):
@@ -2209,7 +2661,7 @@ def create_mcp_app(
         origin_error = _origin_error(settings, request)
         if origin_error:
             return origin_error
-        auth_error = _authenticated(settings, request)
+        auth_error, caller = _authenticate_mcp_caller(settings, request)
         if auth_error:
             return auth_error
 
@@ -2267,7 +2719,7 @@ def create_mcp_app(
         if "method" not in message:
             return Response(status_code=202, headers=headers)
 
-        response = _handle_rpc(message, app)
+        response = _handle_rpc(message, app, caller)
         if initializing:
             headers["MCP-Protocol-Version"] = response["result"]["protocolVersion"]
         # Handshake diagnostics only: never log tokens, params, tool arguments,
@@ -2294,6 +2746,124 @@ def create_mcp_app(
                 headers=headers,
             )
         return JSONResponse(response, headers=headers)
+
+    async def _handle_worker_request(request: Request, operation: str) -> Response:
+        origin_error = _origin_error(settings, request)
+        if origin_error:
+            return origin_error
+        auth_error, worker = _authenticate_worker(settings, request)
+        if auth_error:
+            return auth_error
+        assert worker is not None
+        queue_store_instance: QueueRelayStore | None = app.state.queue_store
+        if queue_store_instance is None:
+            return JSONResponse({"error": "queue_unavailable"}, status_code=503)
+        rate_key = f"{worker.route}:{worker.worker_id}"
+        if _rate_limited(
+            _worker_hits,
+            rate_key,
+            limit=settings.queue_worker_rate_limit_per_minute,
+            window=60,
+        ):
+            LOGGER.warning(
+                "queue_worker operation=%s route=%s worker_id=%s outcome=rate_limited",
+                operation, worker.route, worker.worker_id,
+            )
+            return JSONResponse({"error": "rate_limited"}, status_code=429)
+        raw_body = await request.body()
+        if len(raw_body) > QUEUE_MAX_BODY:
+            return JSONResponse(
+                {"error": "request_too_large", "max_request_bytes": QUEUE_MAX_BODY},
+                status_code=413,
+            )
+        try:
+            payload = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            return JSONResponse({"error": "invalid_request"}, status_code=400)
+        if not isinstance(payload, dict):
+            return JSONResponse({"error": "invalid_request"}, status_code=400)
+
+        started = time.time()
+        try:
+            result = await run_in_threadpool(
+                lambda: queue_store_instance.worker(
+                    worker.route, operation, payload, worker_id=worker.worker_id,
+                )
+            )
+        except QueueConflict as e:
+            elapsed_ms = int((time.time() - started) * 1000)
+            LOGGER.warning(
+                "queue_worker operation=%s route=%s worker_id=%s bridge_id=%s outcome=conflict elapsed_ms=%s",
+                operation, worker.route, worker.worker_id,
+                str(payload.get("bridge_id") or "-")[:128], elapsed_ms,
+            )
+            return JSONResponse({"error": str(e)}, status_code=409)
+        except LookupError as e:
+            elapsed_ms = int((time.time() - started) * 1000)
+            LOGGER.warning(
+                "queue_worker operation=%s route=%s worker_id=%s bridge_id=%s outcome=not_found elapsed_ms=%s",
+                operation, worker.route, worker.worker_id,
+                str(payload.get("bridge_id") or "-")[:128], elapsed_ms,
+            )
+            return JSONResponse({"error": str(e)}, status_code=404)
+        except ValueError as e:
+            elapsed_ms = int((time.time() - started) * 1000)
+            LOGGER.warning(
+                "queue_worker operation=%s route=%s worker_id=%s outcome=bad_request elapsed_ms=%s",
+                operation, worker.route, worker.worker_id, elapsed_ms,
+            )
+            return JSONResponse({"error": str(e)}, status_code=400)
+
+        encoded = json.dumps(result, allow_nan=False).encode("utf-8")
+        if len(encoded) > QUEUE_MAX_BODY:
+            LOGGER.error(
+                "queue_worker operation=%s route=%s worker_id=%s outcome=response_too_large",
+                operation, worker.route, worker.worker_id,
+            )
+            return JSONResponse({"error": "response_too_large"}, status_code=500)
+
+        elapsed_ms = int((time.time() - started) * 1000)
+        if operation == "claim":
+            LOGGER.info(
+                "queue_worker operation=claim route=%s worker_id=%s claims=%s bindings=%s outcome=ok elapsed_ms=%s",
+                worker.route, worker.worker_id,
+                len(result.get("claims", [])), len(result.get("bindings", [])), elapsed_ms,
+            )
+        elif operation == "heartbeat":
+            LOGGER.info(
+                "queue_worker operation=heartbeat route=%s worker_id=%s worker_state=%s outcome=ok elapsed_ms=%s",
+                worker.route, worker.worker_id,
+                str(payload.get("worker_state") or "-"), elapsed_ms,
+            )
+        else:
+            snapshot_state = "-"
+            if operation == "status" and isinstance(payload.get("snapshot"), dict):
+                snapshot_state = str(payload["snapshot"].get("state") or "-")
+            LOGGER.info(
+                "queue_worker operation=%s route=%s worker_id=%s bridge_id=%s worker_job_id=%s state=%s outcome=ok elapsed_ms=%s",
+                operation, worker.route, worker.worker_id,
+                str(payload.get("bridge_id") or "-")[:128],
+                payload.get("job_id"),
+                snapshot_state,
+                elapsed_ms,
+            )
+        return Response(content=encoded, status_code=200, media_type="application/json")
+
+    @app.post("/queue/worker/claim")
+    async def queue_worker_claim(request: Request):
+        return await _handle_worker_request(request, "claim")
+
+    @app.post("/queue/worker/ack")
+    async def queue_worker_ack(request: Request):
+        return await _handle_worker_request(request, "ack")
+
+    @app.post("/queue/worker/status")
+    async def queue_worker_status(request: Request):
+        return await _handle_worker_request(request, "status")
+
+    @app.post("/queue/worker/heartbeat")
+    async def queue_worker_heartbeat(request: Request):
+        return await _handle_worker_request(request, "heartbeat")
 
     return app
 
