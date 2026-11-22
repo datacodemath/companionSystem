@@ -731,6 +731,7 @@ QUEUE_TASK_RECEIPT = {
         "observed_at": NUMBER_OR_NULL,
         "worker_heartbeat_at": NUMBER_OR_NULL,
         "stale": {"type": "boolean"},
+        "created_at": {"type": "number"},
     },
     "required": [
         "job_id",
@@ -746,5 +747,17 @@ QUEUE_TASK_RECEIPT = {
         "observed_at",
         "worker_heartbeat_at",
         "stale",
+        "created_at",
     ],
+}
+
+QUEUE_TASK_LIST = {
+    "type": "object",
+    "properties": {
+        "items": {"type": "array", "items": QUEUE_TASK_RECEIPT},
+        "total": {"type": "integer", "minimum": 0},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+        "next_cursor": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+    },
+    "required": ["items", "total", "limit", "next_cursor"],
 }

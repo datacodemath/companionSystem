@@ -14,6 +14,7 @@ from uuid import uuid4
 
 MAX_BODY = 1024 * 1024
 MAX_BATCH = 8
+MAX_LIST_LIMIT = 50
 COMPANION_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9 _-]{0,62}[A-Za-z0-9_-])?$")
 TERMINAL = {"done", "blocked", "failed"}
 WORKER_STATES = {"running", "idle", "stopped", "unknown"}
@@ -312,6 +313,7 @@ class QueueRelayStore:
                 and state not in TERMINAL
                 and now - observed >= self.stale_seconds
             ),
+            "created_at": row["created_at"],
         }
 
     def _route_heartbeat_at(self, db: sqlite3.Connection, route: str) -> float | None:
@@ -376,6 +378,59 @@ class QueueRelayStore:
                     now,
                     worker_heartbeat_at=self._route_heartbeat_at(db, row["route"]),
                 )
+
+        if operation == "list_jobs":
+            allowed = {"limit", "cursor", "state", "delivery_state", "requester", "executor", "companion"}
+            if arguments.keys() - allowed:
+                raise ValueError("Unexpected list_jobs argument")
+            limit = arguments.get("limit", 20)
+            cursor = arguments.get("cursor")
+            if type(limit) is not int or not 1 <= limit <= MAX_LIST_LIMIT:
+                raise ValueError(f"limit must be between 1 and {MAX_LIST_LIMIT}")
+            if cursor is not None and (type(cursor) is not int or not 0 < cursor < 2**63):
+                raise ValueError("cursor must be a positive sequence number")
+            filters: list[str] = []
+            values: list[Any] = [owner]
+            for key, column in (("requester", "requester"), ("executor", "executor"), ("companion", "companion")):
+                value = arguments.get(key)
+                if value is not None:
+                    filters.append(f"{column} = ?")
+                    values.append(_companion_label(value, key))
+            state = arguments.get("state")
+            if state is not None:
+                if not isinstance(state, str) or state not in TRANSITIONS.keys() | TERMINAL:
+                    raise ValueError("Invalid state")
+                if state == "queued":
+                    filters.append("(json_extract(snapshot, '$.state') = ? OR (snapshot IS NULL AND delivery IN ('pending', 'leased')))")
+                else:
+                    filters.append("json_extract(snapshot, '$.state') = ?")
+                values.append(state)
+            delivery_state = arguments.get("delivery_state")
+            if delivery_state is not None:
+                if delivery_state not in ("pending", "leased", "delivered", "delivery_uncertain"):
+                    raise ValueError("Invalid delivery_state")
+                filters.append("delivery = ?")
+                values.append(delivery_state)
+            count_where = " AND ".join(["owner = ?", *filters])
+            if cursor is not None:
+                filters.append("seq < ?")
+                values.append(cursor)
+            where = " AND ".join(["owner = ?", *filters])
+            with self._transaction() as db:
+                total = db.execute(
+                    f"SELECT COUNT(*) FROM relay_requests WHERE {count_where}",
+                    values[:-1] if cursor is not None else values,
+                ).fetchone()[0]
+                rows = db.execute(
+                    f"SELECT * FROM relay_requests WHERE {where} ORDER BY seq DESC LIMIT ?",
+                    [*values, limit + 1],
+                ).fetchall()
+                has_more = len(rows) > limit
+                rows = rows[:limit]
+                now = self.clock()
+                items = [self._receipt(row, now, worker_heartbeat_at=self._route_heartbeat_at(db, row["route"])) for row in rows]
+            return {"items": items, "total": total, "limit": limit,
+                    "next_cursor": rows[-1]["seq"] if rows and has_more else None}
 
         if operation == "get_task":
             if arguments.keys() - {"job_id", "request_id"}:

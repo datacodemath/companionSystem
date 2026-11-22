@@ -68,6 +68,7 @@ from .tool_schemas import (
     MESSAGE,
     PROFILE,
     QUEUE_TASK_RECEIPT,
+    QUEUE_TASK_LIST,
     SHARED_DEFS,
     START_SESSION,
     mcp_items,
@@ -473,6 +474,7 @@ MCP_OUTPUT_SCHEMAS = {
     "add_records": mcp_items(DYNAMIC_RECORD),
     "queue_task": QUEUE_TASK_RECEIPT,
     "get_task": QUEUE_TASK_RECEIPT,
+    "list_jobs": QUEUE_TASK_LIST,
 }
 
 
@@ -481,6 +483,7 @@ _READ_ONLY_TOOLS = {
     "read_inbox", "list_files", "read_file", "get_ironsworn_resource",
     "list_stores", "query_records", "get_record", "list_shared_files", "read_shared_file",
     "get_task",
+    "list_jobs",
 }
 _OPEN_WORLD_TOOLS = {"send_message"}
 _DESTRUCTIVE_TOOLS = {"forget", "delete_file", "delete_record"}
@@ -962,6 +965,21 @@ QUEUE_MCP_TOOLS = [
                 "maxLength": 128,
                 "description": "Caller-supplied request ID used with queue_task.",
             },
+        },
+        [],
+    ),
+    _tool(
+        "list_jobs",
+        "List Queue Jobs",
+        "List recent jobs owned by the authenticated caller. Results include task IDs, state, delivery state, attribution, timestamps, and receipts. Use a bounded limit and stable cursor pagination.",
+        {
+            "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+            "cursor": {"type": "integer", "minimum": 1, "description": "Continue before the sequence cursor returned by the previous page."},
+            "state": {"type": "string", "enum": ["queued", "running", "manual", "manual_ready", "manual_started", "awaiting", "held", "done", "blocked", "failed"]},
+            "delivery_state": {"type": "string", "enum": ["pending", "leased", "delivered", "delivery_uncertain"]},
+            "requester": {"type": "string", "maxLength": 64, "pattern": QUEUE_COMPANION_PATTERN.pattern},
+            "executor": {"type": "string", "maxLength": 64, "pattern": QUEUE_COMPANION_PATTERN.pattern},
+            "companion": {"type": "string", "maxLength": 64, "pattern": QUEUE_COMPANION_PATTERN.pattern},
         },
         [],
     ),
@@ -2203,17 +2221,19 @@ def _handle_rpc(
                     arguments,
                 )
                 elapsed_ms = int((time.time() - started) * 1000)
-                LOGGER.info(
-                    "mcp_queue_call name=%s principal=%s session=%s job_id=%s request_id=%s delivery_state=%s state=%s outcome=ok elapsed_ms=%s",
-                    name,
-                    verified_caller.principal_id,
-                    verified_caller.session_id or "-",
-                    value["job_id"],
-                    value["request_id"],
-                    value["delivery_state"],
-                    value["state"] or "-",
-                    elapsed_ms,
-                )
+                if name == "list_jobs":
+                    LOGGER.info(
+                        "mcp_queue_call name=%s principal=%s session=%s count=%s outcome=ok elapsed_ms=%s",
+                        name, verified_caller.principal_id, verified_caller.session_id or "-",
+                        len(value["items"]), elapsed_ms,
+                    )
+                else:
+                    LOGGER.info(
+                        "mcp_queue_call name=%s principal=%s session=%s job_id=%s request_id=%s delivery_state=%s state=%s outcome=ok elapsed_ms=%s",
+                        name, verified_caller.principal_id, verified_caller.session_id or "-",
+                        value["job_id"], value["request_id"], value["delivery_state"],
+                        value["state"] or "-", elapsed_ms,
+                    )
                 return _rpc_result(request_id, _tool_result(value))
             except QueueConflict as e:
                 elapsed_ms = int((time.time() - started) * 1000)

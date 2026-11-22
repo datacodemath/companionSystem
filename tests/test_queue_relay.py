@@ -189,6 +189,48 @@ def test_tool_discovery_and_output_schemas(tmp_path, monkeypatch):
         Draft202012Validator(schema_by_name["get_task"]).validate(fetched["structuredContent"])
 
 
+def test_owner_scoped_list_jobs_cursor_filters_and_read_only(tmp_path):
+    with _make_client(tmp_path) as client:
+        empty = _call_tool(client, CHAT1_TOKEN, "list_jobs", {}).json()["result"]["structuredContent"]
+        assert empty == {"items": [], "total": 0, "limit": 20, "next_cursor": None}
+        first = _call_tool(client, CHAT1_TOKEN, "queue_task", {
+            "request_id": "browse-a", "task": "A", "requester": "andres", "executor": "limo", "companion": "limo",
+        }).json()["result"]["structuredContent"]
+        second = _call_tool(client, CHAT1_TOKEN, "queue_task", {
+            "request_id": "browse-b", "task": "B", "requester": "andres", "executor": "limo", "companion": "limo",
+        }).json()["result"]["structuredContent"]
+        store = client.app.state.queue_store
+        claim = store.worker("yoga-primary", "claim", {"version": 1, "limit": 8})["claims"][0]
+        store.worker("yoga-primary", "ack", {
+            "version": 1, "bridge_id": claim["bridge_id"], "lease_id": claim["lease_id"], "job_id": 81,
+        })
+        store.worker("yoga-primary", "status", {
+            "version": 1, "bridge_id": claim["bridge_id"], "job_id": 81,
+            "snapshot": {"id": 81, "priority": 0, "state": "running", "attempts": 1, "result": None, "finished": None},
+        })
+        running = _call_tool(client, CHAT2_TOKEN, "list_jobs", {
+            "state": "running", "requester": "andres", "executor": "limo", "companion": "limo", "limit": 1,
+        }).json()["result"]["structuredContent"]
+        assert running["total"] == 1 and running["items"][0]["job_id"] == first["job_id"]
+        assert running["items"][0]["state"] == "running" and running["items"][0]["created_at"] > 0
+        leased = _call_tool(client, CHAT1_TOKEN, "list_jobs", {"delivery_state": "leased"}).json()["result"]["structuredContent"]
+        assert leased["total"] == 1 and leased["items"][0]["job_id"] == second["job_id"]
+        page = _call_tool(client, CHAT1_TOKEN, "list_jobs", {"limit": 1}).json()["result"]["structuredContent"]
+        assert page["items"][0]["job_id"] == second["job_id"] and page["next_cursor"]
+        with sqlite3.connect(store.path) as db:
+            before = db.execute("SELECT job_id, delivery, worker_job_id, snapshot, observed_at FROM relay_requests ORDER BY seq").fetchall()
+        _call_tool(client, CHAT1_TOKEN, "queue_task", {"request_id": "browse-new", "task": "newer"})
+        next_page = _call_tool(client, CHAT1_TOKEN, "list_jobs", {"limit": 1, "cursor": page["next_cursor"]}).json()["result"]["structuredContent"]
+        assert next_page["items"][0]["job_id"] == first["job_id"]
+        with sqlite3.connect(store.path) as db:
+            after = db.execute("SELECT job_id, delivery, worker_job_id, snapshot, observed_at FROM relay_requests ORDER BY seq").fetchall()
+        assert before == after[:len(before)]
+        other = _call_tool(client, OTHER_OWNER_TOKEN, "list_jobs", {}).json()["result"]["structuredContent"]
+        assert other["items"] == [] and other["total"] == 0
+        denied = _call_tool(client, UNPRIVILEGED_MCP_TOKEN, "list_jobs", {}).json()["result"]
+        assert denied["isError"] and denied["structuredContent"]["error"]["status"] == 403
+
+
 def test_round_trip_dedup_cross_chat_receipt_and_attribution(tmp_path):
     now = [1_000.0]
     with _make_client(tmp_path, clock=lambda: now[0]) as client:
