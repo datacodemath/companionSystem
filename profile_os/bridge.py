@@ -497,6 +497,46 @@ class ToolBridge:
                              json={"kind": kind, "content": content,
                                    "tags": tags or []})
 
+    def upsert_task_participation_memory(
+        self,
+        profile_id: str,
+        task_key: str,
+        *,
+        content: str,
+        kind: str = "note",
+        tags: list[str] | None = None,
+    ):
+        return self._request(
+            "POST",
+            f"/profiles/{profile_id}/task-memories",
+            json={
+                "task_key": task_key,
+                "content": content,
+                "kind": kind,
+                "tags": tags or [],
+            },
+        )
+
+    def set_recent_work(
+        self,
+        profile_id: str,
+        content: str,
+        *,
+        window_days: int = 7,
+        window_start: float | None = None,
+        window_end: float | None = None,
+    ):
+        return self._request(
+            "PUT",
+            f"/profiles/{profile_id}/recent-work",
+            json={
+                "content": content,
+                "window_days": window_days,
+                "window_start": window_start,
+                "window_end": window_end,
+            },
+        )
+
     def search_memories(self, profile_id: str, query: str, limit: int = 20):
         return self._request("GET", f"/profiles/{profile_id}/memories/search",
                              params={"q": query, "limit": limit})

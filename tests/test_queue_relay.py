@@ -189,6 +189,85 @@ def test_tool_discovery_and_output_schemas(tmp_path, monkeypatch):
         Draft202012Validator(schema_by_name["get_task"]).validate(fetched["structuredContent"])
 
 
+def test_owner_scoped_job_browse_filters_pagination_and_numeric_correlation(tmp_path, monkeypatch):
+    monkeypatch.setenv("MCP_OMIT_OUTPUT_SCHEMAS", "0")
+    with _make_client(tmp_path) as client:
+        listed_tools = _call_mcp(client, CHAT1_TOKEN, "tools/list").json()["result"]["tools"]
+        assert {"list_jobs", "get_task"} <= {tool["name"] for tool in listed_tools}
+        assert next(tool for tool in listed_tools if tool["name"] == "list_jobs")["annotations"]["readOnlyHint"] is True
+
+        empty = _call_tool(client, CHAT1_TOKEN, "list_jobs", {}).json()["result"]["structuredContent"]
+        assert empty["items"] == [] and empty["total"] == 0 and empty["next_cursor"] is None
+
+        first = _call_tool(client, CHAT1_TOKEN, "queue_task", {
+            "request_id": "browse-one", "task": "Numeric worker correlation\nDetailed instructions",
+            "backend": "codex", "requester": "andres", "executor": "limo", "companion": "limo",
+            "task_kind": "implementation",
+        }).json()["result"]["structuredContent"]
+        second = _call_tool(client, CHAT1_TOKEN, "queue_task", {
+            "request_id": "browse-two", "task": "Second task", "backend": "agy",
+        }).json()["result"]["structuredContent"]
+
+        store = client.app.state.queue_store
+        claimed = store.worker("yoga-primary", "claim", {"version": 1, "limit": 8})
+        claim = next(item for item in claimed["claims"] if item["bridge_id"])
+        store.worker("yoga-primary", "ack", {
+            "version": 1, "bridge_id": claim["bridge_id"], "lease_id": claim["lease_id"], "job_id": 77,
+        })
+        store.worker("yoga-primary", "status", {
+            "version": 1, "bridge_id": claim["bridge_id"], "job_id": 77,
+            "snapshot": {"id": 77, "priority": 0, "state": "running", "attempts": 1, "result": None, "finished": None},
+        })
+
+        page = _call_tool(client, CHAT2_TOKEN, "list_jobs", {
+            "limit": 1, "offset": 0, "state": "running", "backend": "codex",
+            "requester": "andres", "executor": "limo", "companion": "limo",
+        }).json()["result"]["structuredContent"]
+        assert page["total"] == 1 and len(page["items"]) == 1
+        record = page["items"][0]
+        assert record["job_id"] == first["job_id"]
+        assert record["worker_job_id"] == 77
+        assert record["title"] == "Numeric worker correlation"
+        assert record["instructions"] == "Numeric worker correlation\nDetailed instructions"
+        assert record["state"] == "running"
+        assert record["created_at"] > 0 and record["observed_at"] > 0
+        assert record["routing"]["backend"] == "codex"
+        assert record["routing"]["queue_route"] == "yoga-primary"
+        Draft202012Validator(next(t for t in listed_tools if t["name"] == "list_jobs")["outputSchema"]).validate(page)
+
+        detail = _call_tool(client, CHAT2_TOKEN, "get_task", {"worker_job_id": 77}).json()["result"]["structuredContent"]
+        assert detail["job_id"] == first["job_id"]
+        assert detail["receipt"] is None
+        page2 = _call_tool(client, CHAT1_TOKEN, "list_jobs", {"limit": 1, "offset": 1}).json()["result"]["structuredContent"]
+        assert page2["total"] == 2 and page2["items"][0]["job_id"] == first["job_id"]
+
+        # Cursor pagination remains anchored when newer rows arrive between pages.
+        cursor_page = _call_tool(client, CHAT1_TOKEN, "list_jobs", {"limit": 1}).json()["result"]["structuredContent"]
+        assert cursor_page["items"][0]["job_id"] == second["job_id"]
+        assert cursor_page["next_cursor"] is not None
+        with sqlite3.connect(store.path) as db:
+            before = db.execute(
+                "SELECT job_id, delivery, worker_job_id, snapshot, observed_at FROM relay_requests ORDER BY seq"
+            ).fetchall()
+        _call_tool(client, CHAT1_TOKEN, "queue_task", {
+            "request_id": "browse-newer", "task": "Arrived between pages",
+        })
+        cursor_next = _call_tool(client, CHAT1_TOKEN, "list_jobs", {
+            "limit": 1, "cursor": cursor_page["next_cursor"],
+        }).json()["result"]["structuredContent"]
+        assert cursor_next["items"][0]["job_id"] == first["job_id"]
+        with sqlite3.connect(store.path) as db:
+            after = db.execute(
+                "SELECT job_id, delivery, worker_job_id, snapshot, observed_at FROM relay_requests ORDER BY seq"
+            ).fetchall()
+        assert before == after[:len(before)]
+
+        other_page = _call_tool(client, OTHER_OWNER_TOKEN, "list_jobs", {}).json()["result"]["structuredContent"]
+        assert other_page["total"] == 0 and other_page["items"] == []
+        denied = _call_tool(client, UNPRIVILEGED_MCP_TOKEN, "list_jobs", {}).json()["result"]
+        assert denied["isError"] is True and denied["structuredContent"]["error"]["status"] == 403
+
+
 def test_round_trip_dedup_cross_chat_receipt_and_attribution(tmp_path):
     now = [1_000.0]
     with _make_client(tmp_path, clock=lambda: now[0]) as client:
@@ -320,7 +399,8 @@ def test_round_trip_dedup_cross_chat_receipt_and_attribution(tmp_path):
 
         now[0] = 1_150.0  # > 120s stale window while unfinished
         stale_read = _call_tool(client, CHAT2_TOKEN, "get_task", {"job_id": job_id}).json()["result"]["structuredContent"]
-        assert stale_read["state"] == "running"
+        assert stale_read["state"] is None
+        assert stale_read["snapshot"] is None
         assert stale_read["stale"] is True
 
         now[0] = 1_160.0
@@ -740,7 +820,7 @@ def test_jobqueue_relay_client_end_to_end_round_trip(tmp_path):
     """Exercise actual jobqueue.relay_client.RelayClient + local queue DB
     against the Companions MCP FastAPI app when /home/agent/work is on sys.path."""
     relay_client = pytest.importorskip("jobqueue.relay_client")
-    local_worker = pytest.importorskip("hilo.worker")
+    local_worker = pytest.importorskip("taskqueue.worker")
 
     with _make_client(tmp_path) as client:
         # 1. Companion in Chat 1 submits a task.
