@@ -97,6 +97,30 @@ Argon, Flash low and GPT worker models have no direct task evidence in this
 project yet. Hilo's Luna work is a separately owned receipt; do not count it as
 our own independently verified coding run. Add model entries when exercised.
 
+## 2026-11-22 — GPT orchestration / Task 04c relay acceptance
+
+- No implementation worker used: this task covered the relay architecture and
+  auth contract owned by Limo. Current model label, effort, and token/quota
+  telemetry were not exposed.
+- Found Yoga's client at `/home/agent/tasks/relay_worker.py` (repo HEAD
+  `50ad218`) and the matching Companions worker endpoints in local commit
+  `c6931ed`; local `origin/main` was still at `553aaa6`, before those routes.
+  Compared request/response schemas, auth, snapshot state mapping and local
+  durable binding. No protocol correction was needed.
+- Added `tests/test_task_system_relay_integration.py`, which runs the actual
+  task-system client against Companions' FastAPI app and verifies owner intake,
+  route-scoped bearer relay, durable binding, execution and terminal receipt.
+  It passed 1/1 outside the sandbox; Companions relay tests passed 12 with one
+  pre-existing optional integration skip. Task-system relay/queue/executor
+  suite passed 15/15. The documented TestClient diagnostic passed outside the
+  sandbox; the focused tests stalled only under sandbox restrictions.
+- Outcome: locally accepted. No production service or credentials changed; no
+  live VPS connection was attempted. GitHub push and live deployment/auth
+  confirmation remain separate gates. Review and rescue effort: approximately
+  8 minutes; exact tokens/quota unknown.
+- Evidence: `tests/test_task_system_relay_integration.py`, command output from
+  the Task 04c session, and task-system `EXECUTION_REPORT.md` at base `50ad218`.
+
 Entry fields: date; exact model/provider/effort; task and starting context;
 did well; failed; verification and outcome; attempts/elapsed/review/rescue;
 observed token/quota telemetry or unknown; confidence; routing change; receipts.
