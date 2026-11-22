@@ -57,6 +57,10 @@ def _call_tool(client: TestClient, token: str, name: str, arguments: dict, req_i
     return _call_mcp(client, token, "tools/call", {"name": name, "arguments": arguments}, req_id)
 
 
+def _worker_post(client: TestClient, path: str, token: str, payload: dict):
+    return client.post(path, json=payload, headers={"Authorization": f"Bearer {token}"})
+
+
 def _make_settings(tmp_path: Path, **overrides) -> MCPSettings:
     defaults = dict(
         auth_required=True,
@@ -924,3 +928,195 @@ def test_jobqueue_relay_client_end_to_end_round_trip(tmp_path):
         with closing(sqlite3.connect(tmp_path / "queue-relay.sqlite3")) as relay_db:
             count = relay_db.execute("SELECT COUNT(*) FROM relay_requests").fetchone()[0]
             assert count == 1
+
+
+def test_uncertain_reconciliation_binds_existing_evidence_without_redispatch(tmp_path):
+    now = [1_000.0]
+    with _make_client(tmp_path, clock=lambda: now[0]) as client:
+        submitted = _call_tool(client, CHAT1_TOKEN, "queue_task", {
+            "request_id": "reconcile-existing-1",
+            "task": "Bind the local execution already recorded for this request",
+        }).json()["result"]["structuredContent"]
+        claim = _worker_post(
+            client, "/queue/worker/claim", WORKER_YOGA_TOKEN,
+            {"version": 1, "limit": 1},
+        ).json()["claims"][0]
+        now[0] = claim["deadline"]
+
+        uncertain = _worker_post(
+            client, "/queue/worker/uncertain", WORKER_YOGA_TOKEN,
+            {"version": 1, "limit": 1},
+        )
+        assert uncertain.status_code == 200
+        assert uncertain.json()["uncertain"][0]["bridge_id"] == claim["bridge_id"]
+
+        reconcile = {
+            "version": 1,
+            "bridge_id": claim["bridge_id"],
+            "resolution": "bind_existing",
+            "job_id": 4_242,
+        }
+        # User credentials cannot read or mutate the worker's route state.
+        assert _worker_post(
+            client, "/queue/worker/reconcile", CHAT1_TOKEN, reconcile,
+        ).status_code == 403
+        # A worker bound to another route cannot inspect this bridge ID.
+        assert _worker_post(
+            client, "/queue/worker/reconcile", WORKER_OTHER_TOKEN, reconcile,
+        ).status_code == 404
+
+        accepted = _worker_post(client, "/queue/worker/reconcile", WORKER_YOGA_TOKEN, reconcile)
+        repeated = _worker_post(client, "/queue/worker/reconcile", WORKER_YOGA_TOKEN, reconcile)
+        assert accepted.status_code == repeated.status_code == 200
+
+        receipt = _call_tool(
+            client, CHAT2_TOKEN, "get_task", {"worker_job_id": 4_242},
+        ).json()["result"]["structuredContent"]
+        assert receipt["job_id"] == submitted["job_id"]
+        assert receipt["delivery_state"] == "delivered"
+        assert receipt["worker_job_id"] == 4_242
+        assert receipt["state"] is None  # reconciliation records no fabricated execution status
+
+        # A subsequent poll offers only a status binding; it does not dispatch a second copy.
+        poll = _worker_post(
+            client, "/queue/worker/claim", WORKER_YOGA_TOKEN,
+            {"version": 1, "limit": 1},
+        ).json()
+        assert poll["claims"] == []
+        assert poll["bindings"] == [{"bridge_id": claim["bridge_id"], "job_id": 4_242}]
+
+        # The original acknowledgement can be retried safely after reconciliation.
+        ack = {
+            "version": 1,
+            "bridge_id": claim["bridge_id"],
+            "lease_id": claim["lease_id"],
+            "job_id": 4_242,
+        }
+        assert _worker_post(client, "/queue/worker/ack", WORKER_YOGA_TOKEN, ack).status_code == 200
+        assert _worker_post(client, "/queue/worker/ack", WORKER_YOGA_TOKEN, ack).status_code == 200
+
+        # The same local ID is not exposed through another owner's query.
+        hidden = _call_tool(
+            client, OTHER_OWNER_TOKEN, "get_task", {"worker_job_id": 4_242},
+        ).json()["result"]
+        assert hidden["isError"] is True
+        assert hidden["structuredContent"]["error"]["status"] == 404
+
+
+def test_reconcile_absent_requeues_once_and_rejects_expired_ack(tmp_path):
+    now = [2_000.0]
+    with _make_client(tmp_path, clock=lambda: now[0]) as client:
+        _call_tool(client, CHAT1_TOKEN, "queue_task", {
+            "request_id": "reconcile-absent-1", "task": "No local request record exists",
+        })
+        first = _worker_post(
+            client, "/queue/worker/claim", WORKER_YOGA_TOKEN,
+            {"version": 1, "limit": 1},
+        ).json()["claims"][0]
+        now[0] = first["deadline"]
+        assert _worker_post(
+            client, "/queue/worker/uncertain", WORKER_YOGA_TOKEN,
+            {"version": 1, "limit": 1},
+        ).status_code == 200
+
+        reconcile = {
+            "version": 1,
+            "bridge_id": first["bridge_id"],
+            "resolution": "requeue_absent",
+        }
+        assert _worker_post(client, "/queue/worker/reconcile", WORKER_YOGA_TOKEN, reconcile).status_code == 200
+        assert _worker_post(client, "/queue/worker/reconcile", WORKER_YOGA_TOKEN, reconcile).status_code == 200
+
+        next_claim = _worker_post(
+            client, "/queue/worker/claim", WORKER_YOGA_TOKEN,
+            {"version": 1, "limit": 1},
+        ).json()["claims"]
+        assert len(next_claim) == 1
+        assert next_claim[0]["bridge_id"] == first["bridge_id"]
+        assert next_claim[0]["lease_id"] != first["lease_id"]
+
+        late_ack = _worker_post(
+            client, "/queue/worker/ack", WORKER_YOGA_TOKEN,
+            {
+                "version": 1,
+                "bridge_id": first["bridge_id"],
+                "lease_id": first["lease_id"],
+                "job_id": 100,
+            },
+        )
+        assert late_ack.status_code == 409
+        assert _worker_post(
+            client, "/queue/worker/claim", WORKER_YOGA_TOKEN,
+            {"version": 1, "limit": 1},
+        ).json()["claims"] == []
+
+
+def test_uncertain_query_is_route_scoped_and_bounded(tmp_path):
+    now = [3_000.0]
+    with _make_client(tmp_path, clock=lambda: now[0]) as client:
+        for index in range(10):
+            _call_tool(client, CHAT1_TOKEN, "queue_task", {
+                "request_id": f"uncertain-page-{index}", "task": f"Bounded request {index}",
+            })
+
+        first_batch = _worker_post(
+            client, "/queue/worker/claim", WORKER_YOGA_TOKEN,
+            {"version": 1, "limit": 8},
+        ).json()["claims"]
+        second_batch = _worker_post(
+            client, "/queue/worker/claim", WORKER_YOGA_TOKEN,
+            {"version": 1, "limit": 8},
+        ).json()["claims"]
+        assert len(first_batch) == 8 and len(second_batch) == 2
+        now[0] = first_batch[0]["deadline"]
+
+        bounded = _worker_post(
+            client, "/queue/worker/uncertain", WORKER_YOGA_TOKEN,
+            {"version": 1, "limit": 8},
+        )
+        assert bounded.status_code == 200
+        assert len(bounded.json()["uncertain"]) == 8
+
+        too_large = _worker_post(
+            client, "/queue/worker/uncertain", WORKER_YOGA_TOKEN,
+            {"version": 1, "limit": 9},
+        )
+        assert too_large.status_code == 400
+
+        other_route = _worker_post(
+            client, "/queue/worker/uncertain", WORKER_OTHER_TOKEN,
+            {"version": 1, "limit": 8},
+        )
+        assert other_route.status_code == 200
+        assert other_route.json()["uncertain"] == []
+
+
+def test_local_worker_id_lookup_rejects_ambiguous_route_matches(tmp_path):
+    callers = [
+        QueueCallerBinding(token=CHAT1_TOKEN, owner="andres", route="yoga-primary", label="primary-chat"),
+        QueueCallerBinding(token=CHAT2_TOKEN, owner="andres", route="other-route", label="other-route-chat"),
+    ]
+    with _make_client(tmp_path, queue_callers=callers) as client:
+        for token, worker_token, request_id in (
+            (CHAT1_TOKEN, WORKER_YOGA_TOKEN, "ambiguous-route-a"),
+            (CHAT2_TOKEN, WORKER_OTHER_TOKEN, "ambiguous-route-b"),
+        ):
+            _call_tool(client, token, "queue_task", {"request_id": request_id, "task": request_id})
+            claim = _worker_post(
+                client, "/queue/worker/claim", worker_token,
+                {"version": 1, "limit": 1},
+            ).json()["claims"][0]
+            assert _worker_post(
+                client, "/queue/worker/ack", worker_token,
+                {
+                    "version": 1, "bridge_id": claim["bridge_id"],
+                    "lease_id": claim["lease_id"], "job_id": 77,
+                },
+            ).status_code == 200
+
+        ambiguous = _call_tool(
+            client, CHAT1_TOKEN, "get_task", {"worker_job_id": 77},
+        ).json()["result"]
+        assert ambiguous["isError"] is True
+        assert ambiguous["structuredContent"]["error"]["status"] == 400
+        assert "ambiguous" in ambiguous["structuredContent"]["error"]["message"].lower()
