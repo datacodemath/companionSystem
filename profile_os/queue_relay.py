@@ -14,15 +14,42 @@ from uuid import uuid4
 
 MAX_BODY = 1024 * 1024
 MAX_BATCH = 8
+MAX_LIST_LIMIT = 50
+MAX_MEMORY_CHARS = 240
 COMPANION_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9 _-]{0,62}[A-Za-z0-9_-])?$")
+_PR_REF_RE = re.compile(
+    r"(?:\bpr\s*:\s*[A-Za-z0-9._/-]+#\d+|"
+    r"\b[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#\d+|"
+    r"\bhttps?://github\.com/[^\s]+/pull/\d+(?:/[^\s]*)?|"
+    r"\bpull/\d+\b|\bPR\s*#?\d+\b|#\d+\b)",
+    re.IGNORECASE,
+)
+_COMMIT_REF_RE = re.compile(
+    r"(?:@?sha256:[0-9a-f]{7,64}|"
+    r"@[0-9a-f]{7,40}\b|"
+    r"\b(?:commit|rev(?:ision)?)\s*[:=]?\s*[0-9a-f]{7,40}\b|"
+    r"\b[0-9a-f]{7,40}\b)",
+    re.IGNORECASE,
+)
+_REVIEW_HISTORY_RE = re.compile(
+    r"\b(?:verdict|reviewed_revision|artifact_revision|changes_requested|review_findings?|"
+    r"findings?)\s*[:=].*$",
+    re.IGNORECASE,
+)
+_CREDENTIAL_RE = re.compile(
+    r"(?:Bearer\s+\S+|gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|"
+    r"(?:sk|pk|rk)-[A-Za-z0-9_-]{10,}|AIza[A-Za-z0-9_-]{12,})",
+    re.IGNORECASE,
+)
 TERMINAL = {"done", "blocked", "failed"}
 WORKER_STATES = {"running", "idle", "stopped", "unknown"}
 TRANSITIONS = {
-    "queued": {"queued", "running", "held", "manual_started", *TERMINAL},
-    "running": {"running", *TERMINAL},
-    "manual": {"manual", "manual_ready", "manual_started", "running", "held", "done", "blocked"},
-    "manual_ready": {"manual_ready", "manual_started", "held", "done", "blocked"},
-    "manual_started": {"manual_started", "done", "blocked"},
+    "queued": {"queued", "running", "held", "manual_started", "awaiting", *TERMINAL},
+    "running": {"running", "awaiting", *TERMINAL},
+    "manual": {"manual", "manual_ready", "manual_started", "running", "held", "awaiting", "done", "blocked"},
+    "manual_ready": {"manual_ready", "manual_started", "held", "awaiting", "done", "blocked"},
+    "manual_started": {"manual_started", "awaiting", "done", "blocked"},
+    "awaiting": {"awaiting", "queued", "manual", "manual_ready", "running", "manual_started", "held", *TERMINAL},
     "held": {"held", "queued", "manual", "done", "blocked"},
 }
 WORKER_FIELDS = {
@@ -30,9 +57,12 @@ WORKER_FIELDS = {
     "ack": {"bridge_id", "lease_id", "job_id"},
     "status": {"bridge_id", "job_id", "snapshot"},
     "heartbeat": {"worker_state"},
+    "uncertain": {"limit"},
+    "reconcile": {"bridge_id", "resolution"},
 }
 WORKER_OPTIONAL_FIELDS = {
     "heartbeat": {"queued_local", "running_local"},
+    "reconcile": {"job_id"},
 }
 
 
@@ -294,6 +324,23 @@ class QueueRelayStore:
         snapshot = json.loads(row["snapshot"]) if row["snapshot"] else None
         observed = row["observed_at"]
         state = snapshot["state"] if snapshot else None
+        stale = (
+            observed is not None
+            and state not in TERMINAL
+            and now - observed >= self.stale_seconds
+        )
+        if stale and state in ("running", "manual_started"):
+            state = None
+            snapshot = None
+        payload = json.loads(row["payload"])
+        task = payload.get("task", "")
+        title = next((line.strip() for line in task.splitlines() if line.strip()), "")[:240]
+        routing = {
+            key: payload[key]
+            for key in ("backend", "model", "tier", "effort", "priority", "task_kind", "delegation_mode")
+            if key in payload
+        }
+        routing["queue_route"] = row["route"]
         return {
             "job_id": row["job_id"],
             "request_id": row["request_id"],
@@ -307,11 +354,15 @@ class QueueRelayStore:
             "receipt": snapshot["result"] if snapshot else None,
             "observed_at": observed,
             "worker_heartbeat_at": worker_heartbeat_at,
-            "stale": (
-                observed is not None
-                and state not in TERMINAL
-                and now - observed >= self.stale_seconds
+            "stale": stale,
+            "delivery_action": (
+                "Check worker reconciliation and verify the original bridge ID against local intake before retrying."
+                if delivery == "delivery_uncertain" else None
             ),
+            "title": title,
+            "instructions": task,
+            "routing": routing,
+            "created_at": row["created_at"],
         }
 
     def _route_heartbeat_at(self, db: sqlite3.Connection, route: str) -> float | None:
@@ -377,33 +428,122 @@ class QueueRelayStore:
                     worker_heartbeat_at=self._route_heartbeat_at(db, row["route"]),
                 )
 
+        if operation == "list_jobs":
+            allowed = {"limit", "offset", "cursor", "state", "delivery_state", "backend", "requester", "executor", "companion", "task_kind"}
+            if arguments.keys() - allowed:
+                raise ValueError("Unexpected list_jobs argument")
+            limit = arguments.get("limit", 20)
+            offset = arguments.get("offset", 0)
+            if type(limit) is not int or not 1 <= limit <= MAX_LIST_LIMIT:
+                raise ValueError(f"limit must be between 1 and {MAX_LIST_LIMIT}")
+            if type(offset) is not int or not 0 <= offset < 2**31:
+                raise ValueError("offset must be a nonnegative integer")
+            cursor = arguments.get("cursor")
+            if cursor is not None and (type(cursor) is not int or not 0 < cursor < 2**63):
+                raise ValueError("cursor must be a positive sequence number")
+            if cursor is not None and offset:
+                raise ValueError("cursor cannot be combined with a nonzero offset")
+            filters: list[str] = []
+            values: list[Any] = [owner]
+            for key, column in (("requester", "requester"), ("executor", "executor"), ("companion", "companion")):
+                value = arguments.get(key)
+                if value is not None:
+                    filters.append(f"{column} = ?")
+                    values.append(_companion_label(value, key))
+            task_kind = arguments.get("task_kind")
+            if task_kind is not None:
+                task_kind = _string(task_kind, 32)
+                if task_kind not in ("implementation", "review", "research", "maintenance", "general"):
+                    raise ValueError("Invalid task_kind")
+                filters.append("json_extract(payload, '$.task_kind') = ?")
+                values.append(task_kind)
+            backend = arguments.get("backend")
+            if backend is not None:
+                if backend not in ("codex", "agy", "auto"):
+                    raise ValueError("Invalid backend")
+                filters.append("json_extract(payload, '$.backend') = ?")
+                values.append(backend)
+            delivery_state = arguments.get("delivery_state")
+            if delivery_state is not None:
+                if delivery_state not in ("pending", "leased", "delivered", "delivery_uncertain"):
+                    raise ValueError("Invalid delivery_state")
+                filters.append("delivery = ?")
+                values.append(delivery_state)
+            state = arguments.get("state")
+            if state is not None:
+                if not isinstance(state, str) or state not in TRANSITIONS.keys() | TERMINAL:
+                    raise ValueError("Invalid state")
+                filters.append("json_extract(snapshot, '$.state') = ?")
+                values.append(state)
+            count_where = " AND ".join(["owner = ?", *filters])
+            if cursor is not None:
+                filters.append("seq < ?")
+                values.append(cursor)
+            where = " AND ".join(["owner = ?", *filters])
+            with self._transaction() as db:
+                total = db.execute(
+                    f"SELECT COUNT(*) FROM relay_requests WHERE {count_where}", values[:len(values) - (1 if cursor is not None else 0)]
+                ).fetchone()[0]
+                rows = db.execute(
+                    f"SELECT * FROM relay_requests WHERE {where} ORDER BY seq DESC LIMIT ? OFFSET ?",
+                    [*values, limit + 1, offset],
+                ).fetchall()
+                has_more = len(rows) > limit
+                rows = rows[:limit]
+                now = self.clock()
+                items = [
+                    self._receipt(row, now, worker_heartbeat_at=self._route_heartbeat_at(db, row["route"]))
+                    for row in rows
+                ]
+            return {
+                "items": items,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "next_cursor": rows[-1]["seq"] if rows and has_more else None,
+            }
+
         if operation == "get_task":
-            if arguments.keys() - {"job_id", "request_id"}:
+            if arguments.keys() - {"job_id", "request_id", "worker_job_id"}:
                 raise ValueError("Unexpected get_task argument")
             job_id = arguments.get("job_id")
             request_id = arguments.get("request_id")
-            if job_id is None and request_id is None:
-                raise ValueError("Specify job_id or request_id")
+            worker_job_id = arguments.get("worker_job_id")
+            if worker_job_id is not None and (job_id is not None or request_id is not None):
+                raise ValueError("worker_job_id cannot be combined with job_id or request_id")
+            if job_id is None and request_id is None and worker_job_id is None:
+                raise ValueError("Specify job_id, request_id, or worker_job_id")
             if job_id is not None:
                 job_id = _string(job_id)
             if request_id is not None:
                 request_id = _string(request_id)
+            if worker_job_id is not None and (type(worker_job_id) is not int or not 0 < worker_job_id < 2**63):
+                raise ValueError("Invalid local worker job ID")
             with self._transaction() as db:
-                if job_id is not None and request_id is not None:
-                    row = db.execute(
-                        "SELECT * FROM relay_requests WHERE owner = ? AND job_id = ? AND request_id = ?",
-                        (owner, job_id, request_id),
-                    ).fetchone()
-                elif job_id is not None:
-                    row = db.execute(
-                        "SELECT * FROM relay_requests WHERE owner = ? AND job_id = ?",
-                        (owner, job_id),
-                    ).fetchone()
-                else:
+                if job_id is not None:
+                    if request_id is not None:
+                        row = db.execute(
+                            "SELECT * FROM relay_requests WHERE owner = ? AND job_id = ? AND request_id = ?",
+                            (owner, job_id, request_id),
+                        ).fetchone()
+                    else:
+                        row = db.execute(
+                            "SELECT * FROM relay_requests WHERE owner = ? AND job_id = ?",
+                            (owner, job_id),
+                        ).fetchone()
+                elif request_id is not None:
                     row = db.execute(
                         "SELECT * FROM relay_requests WHERE owner = ? AND request_id = ?",
                         (owner, request_id),
                     ).fetchone()
+                else:
+                    matches = db.execute(
+                        "SELECT * FROM relay_requests WHERE owner = ? AND worker_job_id = ? ORDER BY seq DESC LIMIT 2",
+                        (owner, worker_job_id),
+                    ).fetchall()
+                    if len(matches) > 1:
+                        raise ValueError("Local worker job ID is ambiguous; use job_id")
+                    row = matches[0] if matches else None
                 if row is None:
                     raise LookupError("Task was not found")
                 return self._receipt(
@@ -440,9 +580,24 @@ class QueueRelayStore:
             now = self.clock()
             if operation == "claim":
                 return self._claim(db, route, payload["limit"], now)
+            if operation == "uncertain":
+                return self._uncertain(db, route, payload["limit"], now)
             if operation == "heartbeat":
                 return self._heartbeat(db, route, worker_id, payload, now)
             bridge_id = _string(payload["bridge_id"])
+            if operation == "reconcile":
+                resolution = _string(payload["resolution"], 32)
+                job_id = payload.get("job_id")
+                if job_id is not None:
+                    _worker_job_id(job_id)
+                row = db.execute(
+                    "SELECT * FROM relay_requests WHERE route = ? AND bridge_id = ?",
+                    (route, bridge_id),
+                ).fetchone()
+                if row is None:
+                    raise LookupError("Binding was not found")
+                self._reconcile(db, row, resolution, job_id, now)
+                return {"version": 1, "ok": True}
             job_id = payload["job_id"]
             _worker_job_id(job_id)
             row = db.execute(
@@ -607,3 +762,175 @@ class QueueRelayStore:
             """,
             (encoded, now, int(snapshot["state"] in TERMINAL), row["seq"]),
         )
+
+    def _uncertain(self, db: sqlite3.Connection, route: str, limit: Any, now: float) -> dict[str, Any]:
+        if type(limit) is not int or not 1 <= limit <= MAX_BATCH:
+            raise ValueError("Invalid uncertain limit")
+        db.execute(
+            """
+            UPDATE relay_requests SET delivery = 'delivery_uncertain'
+            WHERE route = ? AND delivery = 'leased' AND deadline <= ?
+            """,
+            (route, now),
+        )
+        rows = db.execute(
+            """
+            SELECT bridge_id, lease_id, deadline, payload FROM relay_requests
+            WHERE route = ? AND delivery = 'delivery_uncertain'
+            ORDER BY seq LIMIT ?
+            """,
+            (route, limit),
+        ).fetchall()
+        return {
+            "version": 1,
+            "uncertain": [
+                {
+                    "bridge_id": row["bridge_id"],
+                    "lease_id": row["lease_id"],
+                    "deadline": row["deadline"],
+                    "request": json.loads(row["payload"]),
+                }
+                for row in rows
+            ],
+        }
+
+    def _reconcile(
+        self,
+        db: sqlite3.Connection,
+        row: sqlite3.Row,
+        resolution: str,
+        job_id: int | None,
+        now: float,
+    ) -> None:
+        if resolution not in ("bind_existing", "requeue_absent"):
+            raise ValueError("Unsupported reconciliation resolution")
+        if resolution == "bind_existing":
+            if job_id is None:
+                raise ValueError("bind_existing requires local job_id")
+            if row["delivery"] == "delivered" and row["worker_job_id"] == job_id:
+                return
+            if row["delivery"] != "delivery_uncertain":
+                raise Conflict("Request is not awaiting reconciliation")
+            try:
+                db.execute(
+                    """
+                    UPDATE relay_requests
+                    SET delivery = 'delivered', worker_job_id = ?, observed_at = COALESCE(observed_at, ?)
+                    WHERE seq = ?
+                    """,
+                    (job_id, now, row["seq"]),
+                )
+            except sqlite3.IntegrityError:
+                raise Conflict("Local job ID already bound on this route") from None
+            return
+
+        if row["delivery"] == "pending" and row["worker_job_id"] is None:
+            return
+        if row["delivery"] != "delivery_uncertain" or row["worker_job_id"] is not None:
+            raise Conflict("Request cannot be requeued from current delivery state")
+        db.execute(
+            """
+            UPDATE relay_requests
+            SET delivery = 'pending', lease_id = NULL, deadline = NULL
+            WHERE seq = ?
+            """,
+            (row["seq"],),
+        )
+
+    def terminal_participation_specs(self, route: str, bridge_id: str) -> list[dict[str, Any]]:
+        """Build one short participated-in-task memory spec per companion for a terminal relay job."""
+        _string(route)
+        _string(bridge_id)
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM relay_requests WHERE route = ? AND bridge_id = ?",
+                (route, bridge_id),
+            ).fetchone()
+        if row is None or not row["snapshot"]:
+            return []
+        snapshot = json.loads(row["snapshot"])
+        state = snapshot.get("state") if isinstance(snapshot, dict) else None
+        if state not in TERMINAL:
+            return []
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+        return build_task_participation_memories(row, payload, snapshot)
+
+
+def sanitize_task_memory_summary(text: str, max_len: int = 140) -> str:
+    """Strip exact PR, commit, review-history, and credential tokens from task summaries."""
+    if not isinstance(text, str):
+        return ""
+    cleaned = _CREDENTIAL_RE.sub("[redacted]", text)
+    cleaned = _REVIEW_HISTORY_RE.sub("", cleaned)
+    cleaned = _PR_REF_RE.sub("", cleaned)
+    cleaned = _COMMIT_REF_RE.sub("", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,:;-")
+    if len(cleaned) > max_len:
+        return cleaned[: max_len - 3].rstrip() + "..."
+    return cleaned
+
+
+def build_task_participation_memories(
+    row: sqlite3.Row | dict[str, Any],
+    payload: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Build at most one short participated-in-task memory per companion and task."""
+    state = snapshot.get("state")
+    if state not in TERMINAL:
+        return []
+    result = snapshot.get("result") if isinstance(snapshot.get("result"), dict) else {}
+    contract = result.get("result_contract") if isinstance(result.get("result_contract"), dict) else {}
+    task_text = payload.get("task") or ""
+    first_line = next((line.strip() for line in task_text.splitlines() if line.strip()), "")
+    short_goal = sanitize_task_memory_summary(first_line)
+    outcome_kind = result.get("outcome_kind")
+    if outcome_kind == "missing_receipt" or result.get("missing_receipt"):
+        outcome_label = "missing receipt"
+    elif outcome_kind == "in_task_blocker" or state == "blocked":
+        outcome_label = "blocked"
+    else:
+        outcome_label = str(state)
+
+    task_key = str(row["job_id"])
+    roles_by_companion: dict[str, list[str]] = {}
+    candidates = [
+        ("requester", row["requester"] or payload.get("requester") or result.get("requester")),
+        ("executor", row["executor"] or payload.get("executor") or result.get("executor")),
+        ("executor", row["companion"] or payload.get("companion") or contract.get("companion") or result.get("companion")),
+    ]
+    for role_name, raw_label in candidates:
+        if not isinstance(raw_label, str):
+            continue
+        clean = raw_label.strip().lower()
+        if not clean or clean in {"none", "unspecified", "null"}:
+            continue
+        bucket = roles_by_companion.setdefault(clean, [])
+        if role_name not in bucket:
+            bucket.append(role_name)
+
+    specs: list[dict[str, Any]] = []
+    for companion_id, roles in roles_by_companion.items():
+        role_text = "/".join(roles)
+        prefix = f"Participated in {task_key}"
+        suffix = f" as {role_text}; outcome: {outcome_label}."
+        if short_goal:
+            budget = MAX_MEMORY_CHARS - len(prefix) - len(suffix) - 3
+            goal_part = short_goal[: budget - 3].rstrip() + "..." if len(short_goal) > budget else short_goal
+            content = f"{prefix} ({goal_part}){suffix}" if budget >= 12 else (prefix + suffix)[:MAX_MEMORY_CHARS]
+        else:
+            content = (prefix + suffix)[:MAX_MEMORY_CHARS]
+        specs.append(
+            {
+                "profile_id": companion_id,
+                "task_key": task_key,
+                "kind": "note",
+                "content": content,
+                "tags": [
+                    "task_participation",
+                    f"task_participation:{task_key}",
+                    f"task_outcome:{state}",
+                ],
+            }
+        )
+    return specs

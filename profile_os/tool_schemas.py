@@ -261,6 +261,7 @@ START_SESSION = {
             },
             "required": ["date", "summary", "notes"],
         }),
+        "recent_work": {"type": "string", "maxLength": 1000},
         "you_got_mail": {"type": "boolean"},
         "selection": {
             "type": "object",
@@ -721,6 +722,7 @@ QUEUE_TASK_RECEIPT = {
             "type": "string",
             "enum": ["pending", "leased", "delivered", "delivery_uncertain"],
         },
+        "delivery_action": STRING_OR_NULL,
         "state": STRING_OR_NULL,
         "worker_job_id": INTEGER_OR_NULL,
         "companion": STRING_OR_NULL,
@@ -731,6 +733,10 @@ QUEUE_TASK_RECEIPT = {
         "observed_at": NUMBER_OR_NULL,
         "worker_heartbeat_at": NUMBER_OR_NULL,
         "stale": {"type": "boolean"},
+        "title": {"type": "string"},
+        "instructions": {"type": "string"},
+        "routing": {"type": "object"},
+        "created_at": {"type": "number"},
     },
     "required": [
         "job_id",
@@ -746,5 +752,22 @@ QUEUE_TASK_RECEIPT = {
         "observed_at",
         "worker_heartbeat_at",
         "stale",
+        "title",
+        "instructions",
+        "routing",
+        "created_at",
     ],
+}
+
+QUEUE_TASK_LIST = {
+    "type": "object",
+    "properties": {
+        "items": {"type": "array", "items": QUEUE_TASK_RECEIPT},
+        "total": {"type": "integer", "minimum": 0},
+        "limit": {"type": "integer", "minimum": 1},
+        "offset": {"type": "integer", "minimum": 0},
+        "next_cursor": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+        "next_cursor": INTEGER_OR_NULL,
+    },
+    "required": ["items", "limit", "offset", "next_cursor"],
 }

@@ -107,6 +107,20 @@ class MemoryEventUpdateIn(BaseModel):
     tags: list[str] | None = None
 
 
+class TaskParticipationMemoryIn(BaseModel):
+    task_key: str = Field(min_length=1, max_length=128)
+    content: str = Field(min_length=1, max_length=280)
+    kind: str = "note"
+    tags: list[str] = Field(default_factory=list)
+
+
+class RecentWorkIn(BaseModel):
+    content: str = Field(max_length=1000)
+    window_days: int = Field(default=7, ge=1, le=90)
+    window_start: float | None = None
+    window_end: float | None = None
+
+
 class MessageIn(BaseModel):
     to_profile_id: str
     content: str
@@ -995,6 +1009,8 @@ def create_app(data_dir: str = DATA_DIR, do_seed: bool = True,
             # Append-only chronological continuity. Unlike memories and
             # few-shot exchanges, this answers what happened in recent sessions.
             "recent_session_log": _wrap(store.recent_session_log, profile_id, 5),
+            # Bounded post-dream work reflection for conversation continuity only.
+            "recent_work": _wrap(store.read_recent_work, profile_id),
             # Deliberately only a flag: inbox contents stay behind read_inbox,
             # but a newly hydrated companion knows when to check it.
             "you_got_mail": bool(_wrap(store.list_inbox, profile_id, True, 1)),
@@ -1115,6 +1131,36 @@ def create_app(data_dir: str = DATA_DIR, do_seed: bool = True,
     def remember(profile_id: str, event: MemoryEventIn, request: Request):
         _require("remember", profile_id, request)
         return _wrap(store.remember, profile_id, event.model_dump())
+
+    @app.post("/profiles/{profile_id}/task-memories")
+    def upsert_task_participation_memory(
+        profile_id: str, body: TaskParticipationMemoryIn, request: Request,
+    ):
+        """Idempotently record or update one short participated-in-task memory."""
+        _require("remember", profile_id, request)
+        return _wrap(
+            store.upsert_task_participation_memory,
+            profile_id,
+            body.task_key,
+            content=body.content,
+            kind=body.kind,
+            tags=body.tags,
+        )
+
+    @app.put("/profiles/{profile_id}/recent-work")
+    def set_recent_work(
+        profile_id: str, body: RecentWorkIn, request: Request,
+    ):
+        """Store or clear compacted post-dream recent-work reflection for conversation hydration."""
+        _require("remember", profile_id, request)
+        return _wrap(
+            store.set_recent_work,
+            profile_id,
+            body.content,
+            window_days=body.window_days,
+            window_start=body.window_start,
+            window_end=body.window_end,
+        )
 
     @app.patch("/profiles/{profile_id}/memories/{event_id}")
     def update_memory(profile_id: str, event_id: str, body: MemoryEventUpdateIn,

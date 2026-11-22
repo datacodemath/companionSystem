@@ -83,6 +83,14 @@ CREATE TABLE IF NOT EXISTS closeouts (
     new_state TEXT NOT NULL,
     created_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS recent_work (
+    profile_id TEXT PRIMARY KEY REFERENCES profiles(id),
+    content TEXT NOT NULL DEFAULT '',
+    window_days INTEGER NOT NULL DEFAULT 7,
+    window_start REAL,
+    window_end REAL,
+    updated_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
     from_profile_id TEXT NOT NULL REFERENCES profiles(id),
@@ -447,6 +455,7 @@ class Store:
             self.db.execute("DELETE FROM memory_events WHERE profile_id=?", (profile_id,))
             self.db.execute("DELETE FROM closeouts WHERE profile_id=?", (profile_id,))
             self.db.execute("DELETE FROM compact_state WHERE profile_id=?", (profile_id,))
+            self.db.execute("DELETE FROM recent_work WHERE profile_id=?", (profile_id,))
             self.db.execute(
                 "DELETE FROM messages WHERE from_profile_id=? OR to_profile_id=?",
                 (profile_id, profile_id))
@@ -628,6 +637,73 @@ class Store:
         return self._event_dict(self.db.execute(
             "SELECT * FROM memory_events WHERE id=?", (eid,)).fetchone())
 
+    def upsert_task_participation_memory(
+        self,
+        profile_id: str,
+        task_key: str,
+        *,
+        content: str,
+        kind: str = "note",
+        tags: list[str] | None = None,
+    ) -> dict:
+        """Write or update one short participated-in-task memory per companion and task.
+
+        Conversation lifecycle (`closeouts`, `compact_state`, `recent_session_log`)
+        is kept completely independent.
+        """
+        self._require_profile(profile_id)
+        if not isinstance(task_key, str) or not task_key.strip() or len(task_key.strip()) > 128:
+            raise MalformedMemoryEvent("task_key must be 1 to 128 non-blank characters")
+        clean_key = task_key.strip()
+        if not kind or kind not in MEMORY_KINDS:
+            raise MalformedMemoryEvent(f"kind must be one of {sorted(MEMORY_KINDS)}")
+        if not isinstance(content, str) or not content.strip():
+            raise MalformedMemoryEvent("content must be a non-empty string")
+        clean_content = content.strip()
+        if len(clean_content) > 280:
+            raise MalformedMemoryEvent("task participation memory exceeds 280 characters")
+        if tags is not None and (not isinstance(tags, list) or not all(isinstance(t, str) for t in tags)):
+            raise MalformedMemoryEvent("tags must be a list of strings")
+
+        key_tag = f"task_participation:{clean_key}"
+        merged_tags = []
+        for tag in ["task_participation", key_tag, *(tags or [])]:
+            if tag and tag not in merged_tags:
+                merged_tags.append(tag)
+        encoded_tags = json.dumps(merged_tags)
+        now = time.time()
+
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            rows = self.db.execute(
+                "SELECT id, tags FROM memory_events WHERE profile_id=? ORDER BY created_at DESC",
+                (profile_id,),
+            ).fetchall()
+            existing_id = None
+            for row in rows:
+                try:
+                    row_tags = json.loads(row["tags"])
+                except (TypeError, json.JSONDecodeError):
+                    row_tags = []
+                if isinstance(row_tags, list) and key_tag in row_tags:
+                    existing_id = row["id"]
+                    break
+            if existing_id is not None:
+                self.db.execute(
+                    "UPDATE memory_events SET kind=?, content=?, tags=? WHERE id=? AND profile_id=?",
+                    (kind, clean_content, encoded_tags, existing_id, profile_id),
+                )
+                target_id = existing_id
+            else:
+                target_id = str(uuid.uuid4())
+                self.db.execute(
+                    "INSERT INTO memory_events (id, profile_id, kind, content, tags, created_at)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (target_id, profile_id, kind, clean_content, encoded_tags, now),
+                )
+        return self._event_dict(self.db.execute(
+            "SELECT * FROM memory_events WHERE id=?", (target_id,)).fetchone())
+
     def _require_memory(self, profile_id: str, event_id: str) -> sqlite3.Row:
         row = self.db.execute(
             "SELECT * FROM memory_events WHERE id=? AND profile_id=?",
@@ -798,6 +874,8 @@ class Store:
     MAX_FILE_BYTES = 256 * 1024
     SOUL_FILENAME = "SOUL.md"
     MAX_SOUL_BYTES = 16 * 1024
+    MAX_RECENT_WORK_CHARS = 1000
+    DEFAULT_RECENT_WORK_WINDOW_DAYS = 7
 
     @classmethod
     def _validate_filename(cls, filename: str) -> None:
@@ -840,6 +918,73 @@ class Store:
             return data.decode("utf-8")
         except UnicodeDecodeError as error:
             raise MalformedRecord("SOUL.md must be valid UTF-8") from error
+
+    def set_recent_work(
+        self,
+        profile_id: str,
+        content: str,
+        *,
+        window_days: int = DEFAULT_RECENT_WORK_WINDOW_DAYS,
+        window_start: float | None = None,
+        window_end: float | None = None,
+        updated_at: float | None = None,
+    ) -> dict:
+        """Store the bounded first-person recent-work reflection compacted after dreams."""
+        self._require_profile(profile_id)
+        if not isinstance(content, str):
+            raise MalformedRecord("recent_work content must be a string")
+        clean_content = content.strip()
+        if len(clean_content) > self.MAX_RECENT_WORK_CHARS:
+            raise MalformedRecord(
+                f"recent_work exceeds {self.MAX_RECENT_WORK_CHARS} characters"
+            )
+        if type(window_days) is not int or not 1 <= window_days <= 90:
+            raise MalformedRecord("window_days must be an integer between 1 and 90")
+        now = time.time() if updated_at is None else float(updated_at)
+        eff_end = now if window_end is None else float(window_end)
+        eff_start = (
+            eff_end - window_days * 86400
+            if window_start is None
+            else float(window_start)
+        )
+        with self.db:
+            self.db.execute(
+                "INSERT INTO recent_work "
+                "(profile_id, content, window_days, window_start, window_end, updated_at) "
+                "VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(profile_id) DO UPDATE SET "
+                "content=excluded.content, window_days=excluded.window_days, "
+                "window_start=excluded.window_start, window_end=excluded.window_end, "
+                "updated_at=excluded.updated_at",
+                (profile_id, clean_content, window_days, eff_start, eff_end, now),
+            )
+        return {
+            "profile_id": profile_id,
+            "content": clean_content,
+            "window_days": window_days,
+            "window_start": eff_start,
+            "window_end": eff_end,
+            "updated_at": now,
+        }
+
+    def read_recent_work(self, profile_id: str, *, now: float | None = None) -> str:
+        """Return bounded recent-work text if present and still within its time window."""
+        self._require_profile(profile_id)
+        row = self.db.execute(
+            "SELECT content, window_days, window_end, updated_at "
+            "FROM recent_work WHERE profile_id=?",
+            (profile_id,),
+        ).fetchone()
+        if row is None or not row["content"]:
+            return ""
+        current = time.time() if now is None else float(now)
+        window_seconds = (
+            max(1, int(row["window_days"] or self.DEFAULT_RECENT_WORK_WINDOW_DAYS)) * 86400
+        )
+        anchor = row["window_end"] if row["window_end"] is not None else row["updated_at"]
+        if anchor is None or (current - float(anchor)) > window_seconds:
+            return ""
+        return row["content"]
 
     def read_file(self, profile_id: str, filename: str) -> dict:
         self._require_profile(profile_id)

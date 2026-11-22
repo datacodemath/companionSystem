@@ -117,7 +117,7 @@ def test_task_system_relay_round_trip_against_companions_app(tmp_path):
                 ).fetchone()
             finally:
                 binding_db.close()
-            assert relay_job_id == 1
+            assert relay_job_id == relay_module.RELAY_JOB_ID_BASE + 1
             task = task_queue.get_task(db, request_id=bridge_id)
             assert task["state"] == "queued"
 
@@ -143,5 +143,5 @@ def test_task_system_relay_round_trip_against_companions_app(tmp_path):
         ).json()["result"]["structuredContent"]
         assert receipt["delivery_state"] == "delivered"
         assert receipt["state"] == "done"
-        assert receipt["worker_job_id"] == 1
+        assert receipt["worker_job_id"] == relay_job_id
         assert receipt["receipt"]["summary"] == "Relay integration verified"

@@ -68,6 +68,7 @@ from .tool_schemas import (
     MESSAGE,
     PROFILE,
     QUEUE_TASK_RECEIPT,
+    QUEUE_TASK_LIST,
     SHARED_DEFS,
     START_SESSION,
     mcp_items,
@@ -81,6 +82,71 @@ SERVER_VERSION = "0.1.0"
 SCOPE = "profile-os"
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _sync_relay_task_memories(
+    bridge: Any,
+    queue_store_instance: QueueRelayStore,
+    route: str,
+    bridge_id: str,
+) -> None:
+    """Write or update one short participated-in-task memory per companion and task."""
+    specs = queue_store_instance.terminal_participation_specs(route, bridge_id)
+    if not specs:
+        return
+    try:
+        known_profiles = {
+            str(p.get("id", "")).strip().lower()
+            for p in (bridge.list_profiles() or [])
+            if isinstance(p, dict) and p.get("id")
+        }
+    except Exception:
+        known_profiles = None
+
+    for spec in specs:
+        profile_id = spec["profile_id"]
+        if known_profiles is not None and profile_id not in known_profiles:
+            continue
+        try:
+            if hasattr(bridge, "upsert_task_participation_memory"):
+                bridge.upsert_task_participation_memory(
+                    profile_id,
+                    spec["task_key"],
+                    content=spec["content"],
+                    kind=spec["kind"],
+                    tags=spec["tags"],
+                )
+            else:
+                key_tag = f"task_participation:{spec['task_key']}"
+                existing = next(
+                    (
+                        item
+                        for item in (bridge.search_memories(profile_id, spec["task_key"], limit=50) or [])
+                        if isinstance(item, dict)
+                        and (item.get("profile_id") in (None, profile_id))
+                        and key_tag in (item.get("tags") or [])
+                    ),
+                    None,
+                )
+                if existing is not None and hasattr(bridge, "update_memory"):
+                    bridge.update_memory(
+                        profile_id,
+                        existing["id"],
+                        kind=spec["kind"],
+                        content=spec["content"],
+                        tags=spec["tags"],
+                    )
+                elif existing is None:
+                    bridge.remember(
+                        profile_id,
+                        spec["kind"],
+                        spec["content"],
+                        tags=spec["tags"],
+                    )
+        except ToolBridgeError as err:
+            if err.status_code == 404:
+                continue
+            raise
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -360,6 +426,7 @@ def _session_inspector_page(profiles: list[dict], *, selected_id: str = "",
             output += block("Global identity (whoami)", "Canonical external identity file, when the bridge has identity:read.", result.get("identity"))
             output += block("Memories", "Mutable context, newest first. Tags and database IDs are intentionally hidden here; use the raw payload for lookup fields.", memory_context)
             output += block("Recent session log", "Append-only chronological handoffs, newest first and bounded to five entries.", result.get("recent_session_log"))
+            output += block("Recent work", "Bounded first-person work reflection compacted after dreams for conversation hydration; omitted in task/forum/editor/actor modes.", result.get("recent_work"))
             output += block("Data sources", "Profile stores and shared projects this companion may use in this session.", result.get("data_sources"))
             output += block("Companion directory", "The current companion cast; it does not include private context.", result.get("companion_directory"))
     return f"""<!doctype html>
@@ -473,6 +540,7 @@ MCP_OUTPUT_SCHEMAS = {
     "add_records": mcp_items(DYNAMIC_RECORD),
     "queue_task": QUEUE_TASK_RECEIPT,
     "get_task": QUEUE_TASK_RECEIPT,
+    "list_jobs": QUEUE_TASK_LIST,
 }
 
 
@@ -480,7 +548,7 @@ _READ_ONLY_TOOLS = {
     "resolve_companion", "discover_companions", "summon_companion", "search_memories", "search_context",
     "read_inbox", "list_files", "read_file", "get_ironsworn_resource",
     "list_stores", "query_records", "get_record", "list_shared_files", "read_shared_file",
-    "get_task",
+    "get_task", "list_jobs",
 }
 _OPEN_WORLD_TOOLS = {"send_message"}
 _DESTRUCTIVE_TOOLS = {"forget", "delete_file", "delete_record"}
@@ -962,6 +1030,29 @@ QUEUE_MCP_TOOLS = [
                 "maxLength": 128,
                 "description": "Caller-supplied request ID used with queue_task.",
             },
+            "worker_job_id": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Numeric local Yoga worker ID from list_jobs; owner-scoped correlation to its qjob record.",
+            },
+        },
+        [],
+    ),
+    _tool(
+        "list_jobs",
+        "List Queue Jobs",
+        "List jobs owned by the authenticated caller. Results include IDs, state, timestamps, routing and receipts. Use a bounded limit and cursor for stable pagination; offset is also supported.",
+        {
+            "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+            "offset": {"type": "integer", "minimum": 0, "default": 0},
+            "cursor": {"type": "integer", "minimum": 1, "description": "Continue before this internal sequence cursor returned by the previous page."},
+            "state": {"type": "string", "enum": ["queued", "running", "manual", "manual_ready", "manual_started", "awaiting", "held", "done", "blocked", "failed"]},
+            "delivery_state": {"type": "string", "enum": ["pending", "leased", "delivered", "delivery_uncertain"]},
+            "backend": {"type": "string", "enum": ["codex", "agy", "auto"]},
+            "requester": {"type": "string", "maxLength": 64, "pattern": QUEUE_COMPANION_PATTERN.pattern},
+            "executor": {"type": "string", "maxLength": 64, "pattern": QUEUE_COMPANION_PATTERN.pattern},
+            "companion": {"type": "string", "maxLength": 64, "pattern": QUEUE_COMPANION_PATTERN.pattern},
+            "task_kind": {"type": "string", "enum": ["implementation", "review", "research", "maintenance", "general"]},
         },
         [],
     ),
@@ -1714,7 +1805,7 @@ class MCPToolRunner:
         # Session autobiography belongs to human conversations. Autonomous
         # forum wakes receive their bounded Thread continuity instead.
         session = {key: value for key, value in session.items()
-                   if key != "recent_session_log"}
+                   if key not in {"recent_session_log", "recent_work"}}
         profile_id = session["selection"]["profile_id"]
         rows = self.bridge.query_records(
             profile_id, "thread_continuity", limit=200)
@@ -2203,17 +2294,24 @@ def _handle_rpc(
                     arguments,
                 )
                 elapsed_ms = int((time.time() - started) * 1000)
-                LOGGER.info(
-                    "mcp_queue_call name=%s principal=%s session=%s job_id=%s request_id=%s delivery_state=%s state=%s outcome=ok elapsed_ms=%s",
-                    name,
-                    verified_caller.principal_id,
-                    verified_caller.session_id or "-",
-                    value["job_id"],
-                    value["request_id"],
-                    value["delivery_state"],
-                    value["state"] or "-",
-                    elapsed_ms,
-                )
+                if name == "list_jobs":
+                    LOGGER.info(
+                        "mcp_queue_call name=%s principal=%s session=%s count=%s offset=%s outcome=ok elapsed_ms=%s",
+                        name, verified_caller.principal_id, verified_caller.session_id or "-",
+                        len(value["items"]), value["offset"], elapsed_ms,
+                    )
+                else:
+                    LOGGER.info(
+                        "mcp_queue_call name=%s principal=%s session=%s job_id=%s request_id=%s delivery_state=%s state=%s outcome=ok elapsed_ms=%s",
+                        name,
+                        verified_caller.principal_id,
+                        verified_caller.session_id or "-",
+                        value["job_id"],
+                        value["request_id"],
+                        value["delivery_state"],
+                        value["state"] or "-",
+                        elapsed_ms,
+                    )
                 return _rpc_result(request_id, _tool_result(value))
             except QueueConflict as e:
                 elapsed_ms = int((time.time() - started) * 1000)
@@ -2814,6 +2912,26 @@ def create_mcp_app(
             )
             return JSONResponse({"error": str(e)}, status_code=400)
 
+        if operation == "status" and isinstance(payload.get("snapshot"), dict):
+            snap_state = payload["snapshot"].get("state")
+            if snap_state in {"done", "blocked", "failed"}:
+                try:
+                    await run_in_threadpool(
+                        lambda: _sync_relay_task_memories(
+                            app.state.runner.bridge,
+                            queue_store_instance,
+                            worker.route,
+                            str(payload["bridge_id"]),
+                        )
+                    )
+                except Exception:
+                    LOGGER.warning(
+                        "queue_worker task_memory_sync failed route=%s bridge_id=%s",
+                        worker.route,
+                        str(payload.get("bridge_id") or "-")[:128],
+                        exc_info=True,
+                    )
+
         encoded = json.dumps(result, allow_nan=False).encode("utf-8")
         if len(encoded) > QUEUE_MAX_BODY:
             LOGGER.error(
@@ -2864,6 +2982,14 @@ def create_mcp_app(
     @app.post("/queue/worker/heartbeat")
     async def queue_worker_heartbeat(request: Request):
         return await _handle_worker_request(request, "heartbeat")
+
+    @app.post("/queue/worker/uncertain")
+    async def queue_worker_uncertain(request: Request):
+        return await _handle_worker_request(request, "uncertain")
+
+    @app.post("/queue/worker/reconcile")
+    async def queue_worker_reconcile(request: Request):
+        return await _handle_worker_request(request, "reconcile")
 
     return app
 

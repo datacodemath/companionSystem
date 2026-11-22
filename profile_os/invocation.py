@@ -142,6 +142,7 @@ def build_invocation(store, dyn, profile_id, options, *, identity_file=None,
         packet['recent_exchanges'] = store.recent_exchanges(profile_id,4)
         if mode == 'conversation':
             packet['recent_session_log'] = store.recent_session_log(profile_id,5)
+            packet['recent_work'] = store.read_recent_work(profile_id)
         packet['you_got_mail'] = bool(store.list_inbox(profile_id,True,1))
         if can_read_records:
             packet['data_sources'] = {'profile_stores': [
