@@ -5,7 +5,7 @@ from jsonschema import Draft202012Validator
 from profile_os.api import create_app
 from profile_os.bridge import ToolBridge, ToolBridgeError
 from profile_os.mcp_server import MCPToolRunner, CloseoutCodeState, MCP_TOOLS
-from profile_os.tool_schemas import START_SESSION
+from profile_os.tool_schemas import MODEL_HYDRATION_SESSION
 
 
 @pytest.fixture
@@ -22,7 +22,7 @@ def env(tmp_path):
 
 
 def check(packet):
-    Draft202012Validator(START_SESSION).validate(packet)
+    Draft202012Validator(MODEL_HYDRATION_SESSION).validate(packet)
 
 
 def test_legacy_packets_unchanged(env):
@@ -31,6 +31,8 @@ def test_legacy_packets_unchanged(env):
         p=r.call('summon_companion',args)
         check(p)
         assert 'hydration' not in p and 'invocation' not in p
+        assert 'selection' not in p
+        assert p['profile']['id']=='tara'
         assert p['identity']=='OWNER_PRIVATE_CANARY'
         assert p['memories'][0]['content']=='MEMORY_PRIVATE_CANARY'
     forum=r.call('summon_companion',{'profile_id':'tara','mode':'forum'})
@@ -58,30 +60,32 @@ def test_modes_keep_voice_avoid_private_autobiography_and_no_side_effects(env,mo
     assert not {'memories','compact_state','recent_exchanges','recent_session_log','companion_directory','data_sources'} & p.keys()
     assert p['invocation']['mode']==mode
     assert p['invocation']['task']['brief']=='task only'
-    assert p['hydration']['receipt']['retention_verified'] is False
+    assert 'hydration' not in p and 'selection' not in p
+    assert 'signature' not in p['profile'] and 'aliases' not in p['profile']
+    assert p['profile']['allowed_tools'] is not None
     assert app.state.store.search('tara','task only')==[]
 
 
-def test_delta_uses_declaration_no_receipt_and_reload(env):
+def test_delta_uses_declaration_without_model_facing_receipt_or_section_inventory(env):
     app,c,b,r=env
     p=r.call('summon_companion',{'profile_id':'tara','mode':'secondary',
         'session':{'id':'host','available_sections':['identity','system_contracts','companion_directory']}})
     check(p)
     assert p['invocation']['mode']=='conversation'
-    assert p['hydration']['effective']=='delta'
+    assert 'hydration' not in p and 'selection' not in p
     assert not {'identity','system_contracts','companion_directory'} & p.keys()
     assert p['who_you_are'] and p['what_you_do']
     assert p['voice']==app.state.store._prompt_sections('tara')['voice']
-    assert p['hydration']['warnings']
-    full=r.call('summon_companion',p['hydration']['reload'])
+    assert p['warnings']
+    assert 'retention is not verified' in p['warnings'][0]
+    full=r.call('summon_companion',{'profile_id':'tara','mode':'conversation','hydration':'full'})
     check(full)
-    assert full['hydration']['effective']=='full'
     assert full['identity']=='OWNER_PRIVATE_CANARY'
     assert 'system_contracts' in full
     for args in [{'profile_id':'tara','hydration':'delta'},
                  {'profile_id':'tara','hydration':'delta','session':{'context_reset':True,'available_sections':['identity']}}]:
         p=r.call('summon_companion',args)
-        assert p['hydration']['fallback_to_full']
+        assert 'hydration' not in p
         assert p['identity']=='OWNER_PRIVATE_CANARY'
 
 
@@ -91,7 +95,7 @@ def test_editor_actor_workbench_and_unresolved_references(env):
     assert 'not votes' in editor['invocation']['instructions']
     actor=r.call('summon_companion',{'profile_id':'tara','mode':'actor',
         'task':{'character':{'id':'Mara','knowledge_scope':'only the village','motivation':'find shelter','scene':'rain'}}})
-    assert actor['invocation']['isolation']=='narrative_instructions_only'
+    assert 'isolation' not in actor['invocation']
     assert actor['invocation']['task']['character']['id']=='Mara'
     assert 'director' in actor['invocation']['instructions']
     work=r.call('summon_companion',{'profile_id':'tara','mode':'workbench','task':{
@@ -100,7 +104,7 @@ def test_editor_actor_workbench_and_unresolved_references(env):
                        'commands':['touch /tmp/must-not-run'],'authorization_scope':'deploy'}}})
     assert work['invocation']['task']['environment']['diagnostics']=='test failed'
     assert 'not a grant' in work['invocation']['instructions']
-    assert any('not loaded' in x for x in work['hydration']['warnings'])
+    assert any('not loaded' in x for x in work['warnings'])
     assert 'unchanged' in work['invocation']['permissions']
 
 
@@ -149,6 +153,6 @@ def test_catalog_and_five_distinct_companions(env):
     packets=[r.call('summon_companion',{'profile_id':name,'mode':'editor','hydration':'delta',
             'session':{'available_sections':['system_contracts']}}) for name in names]
     for p in packets: check(p)
-    assert len({p['selection']['profile_id'] for p in packets})==5
+    assert len({p['profile']['id'] for p in packets})==5
     assert len({p['who_you_are'] for p in packets})==5
     assert sum(len(json.dumps(p)) for p in packets) < sum(len(json.dumps(b.start_session(name))) for name in names)

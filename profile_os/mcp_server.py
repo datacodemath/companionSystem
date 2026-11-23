@@ -33,6 +33,7 @@ from starlette.concurrency import run_in_threadpool
 
 from pydantic import ValidationError
 from .invocation import InvocationOptions, input_properties
+from .hydration import model_facing_hydration
 from .bridge import ToolBridge, ToolBridgeError
 from .queue_relay import (
     COMPANION_PATTERN as QUEUE_COMPANION_PATTERN,
@@ -69,7 +70,7 @@ from .tool_schemas import (
     PROFILE,
     QUEUE_TASK_RECEIPT,
     SHARED_DEFS,
-    START_SESSION,
+    MODEL_HYDRATION_SESSION,
     mcp_items,
 )
 
@@ -440,7 +441,7 @@ MCP_OUTPUT_SCHEMAS = {
     # Kept as an internal summon_companion fallback, not a callable MCP tool.
     # "resolve_companion": PROFILE_RESOLUTION,
     "discover_companions": mcp_items(PROFILE),
-    "summon_companion": START_SESSION,
+    "summon_companion": MODEL_HYDRATION_SESSION,
     "propose_prompt_edit": APPROVAL,
     # Legacy backend/admin operation; no companion-callable MCP path.
     # "update_own_description": PROFILE,
@@ -1560,13 +1561,13 @@ class MCPToolRunner:
             else:
                 if forum_mode:
                     session = self._with_forum_continuity(session)
-                return self._with_tool_probe_catalog(session)
+                return model_facing_hydration(self._with_tool_probe_catalog(session))
             resolution = self.bridge.resolve_companion(requested)
             if resolution["status"] == "resolved":
                 session = load_session(resolution["resolved_profile_id"])
                 if forum_mode:
                     session = self._with_forum_continuity(session)
-                return self._with_tool_probe_catalog(session)
+                return model_facing_hydration(self._with_tool_probe_catalog(session))
             ids = [profile["id"] for profile in resolution["candidates"]]
             if resolution["status"] == "ambiguous":
                 raise ToolBridgeError(
@@ -1737,10 +1738,6 @@ class MCPToolRunner:
             used_chars += item_chars
             if len(selected) == 12:
                 break
-        if "hydration" in session:
-            delivered = sorted((set(session) - {"hydration"}) | {"identity", "thread_continuity", "thread_continuity_write_contract"})
-            session["hydration"]["included_sections"] = delivered
-            session["hydration"]["receipt"]["delivered_sections"] = delivered
         return {
             **session,
             "identity": None,
@@ -2523,6 +2520,7 @@ def create_mcp_app(
         except ToolBridgeError as e:
             return HTMLResponse(_session_inspector_page(profiles, selected_id=profile_id,
                                                         mode=mode, error=e.detail), status_code=e.status_code)
+        result = model_facing_hydration(result)
         return HTMLResponse(_session_inspector_page(profiles, selected_id=profile_id,
                                                     mode=mode, result=result))
 
