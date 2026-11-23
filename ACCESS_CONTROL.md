@@ -247,6 +247,7 @@ whatever a companion's memory says on conflict. Exposed as the MCP tool
 | `POST /profiles` | global `create_profile`; auto-grants owner bundle on the new profile |
 | `GET /profiles/{id}`, `POST /profiles/{id}/boot` | `boot` |
 | `POST /profiles/{id}/memories` | `remember` |
+| `GET, PUT /profiles/{id}/sleep-checkpoint` | `remember` (cursor metadata only; no task contents) |
 | `PATCH \| DELETE /profiles/{id}/memories/{event_id}` | `remember` (self-service edit/erase, no admin approval) |
 | `POST /profiles/{from_id}/messages` | `remember` on `from_id` (self-service, no admin approval) |
 | `GET /profiles/{id}/inbox`, `POST /profiles/{id}/inbox/{message_id}/read` | `search` |

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import shutil
 import sqlite3
@@ -90,6 +91,19 @@ CREATE TABLE IF NOT EXISTS recent_work (
     window_start REAL,
     window_end REAL,
     updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sleep_checkpoints (
+    profile_id TEXT PRIMARY KEY REFERENCES profiles(id),
+    closeout_cursor INTEGER NOT NULL DEFAULT 0,
+    last_request_id TEXT,
+    last_successful_at REAL
+);
+CREATE TABLE IF NOT EXISTS sleep_runs (
+    profile_id TEXT NOT NULL REFERENCES profiles(id),
+    request_id TEXT NOT NULL,
+    closeout_cursor INTEGER NOT NULL,
+    completed_at REAL NOT NULL,
+    PRIMARY KEY (profile_id, request_id)
 );
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
@@ -456,6 +470,8 @@ class Store:
             self.db.execute("DELETE FROM closeouts WHERE profile_id=?", (profile_id,))
             self.db.execute("DELETE FROM compact_state WHERE profile_id=?", (profile_id,))
             self.db.execute("DELETE FROM recent_work WHERE profile_id=?", (profile_id,))
+            self.db.execute("DELETE FROM sleep_checkpoints WHERE profile_id=?", (profile_id,))
+            self.db.execute("DELETE FROM sleep_runs WHERE profile_id=?", (profile_id,))
             self.db.execute(
                 "DELETE FROM messages WHERE from_profile_id=? OR to_profile_id=?",
                 (profile_id, profile_id))
@@ -985,6 +1001,72 @@ class Store:
         if anchor is None or (current - float(anchor)) > window_seconds:
             return ""
         return row["content"]
+
+    def get_sleep_checkpoint(self, profile_id: str) -> dict:
+        """Return the last successfully completed sleep cursor, without task contents."""
+        self._require_profile(profile_id)
+        row = self.db.execute(
+            "SELECT closeout_cursor, last_request_id, last_successful_at "
+            "FROM sleep_checkpoints WHERE profile_id=?", (profile_id,),
+        ).fetchone()
+        if row is None:
+            return {
+                "profile_id": profile_id,
+                "closeout_cursor": 0,
+                "last_request_id": None,
+                "last_successful_at": None,
+            }
+        return {
+            "profile_id": profile_id,
+            "closeout_cursor": int(row["closeout_cursor"]),
+            "last_request_id": row["last_request_id"],
+            "last_successful_at": row["last_successful_at"],
+        }
+
+    def complete_sleep(
+        self, profile_id: str, request_id: str, closeout_cursor: int,
+        *, completed_at: float | None = None,
+    ) -> dict:
+        """Advance the sleep cursor only after a fully persisted, idempotent sleep."""
+        self._require_profile(profile_id)
+        if not isinstance(request_id, str) or not request_id.strip() or len(request_id.strip()) > 128:
+            raise MalformedRecord("request_id must be 1 to 128 non-blank characters")
+        request_id = request_id.strip()
+        if type(closeout_cursor) is not int or not 0 <= closeout_cursor < 2**63:
+            raise MalformedRecord("closeout_cursor must be a non-negative integer")
+        current = time.time() if completed_at is None else float(completed_at)
+        if not math.isfinite(current) or current <= 0:
+            raise MalformedRecord("completed_at must be positive")
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            prior = self.db.execute(
+                "SELECT closeout_cursor, completed_at FROM sleep_runs "
+                "WHERE profile_id=? AND request_id=?", (profile_id, request_id),
+            ).fetchone()
+            if prior is not None:
+                if int(prior["closeout_cursor"]) != closeout_cursor:
+                    raise MalformedRecord("request_id was already completed with a different cursor")
+                result = self.get_sleep_checkpoint(profile_id)
+                return {**result, "duplicate": True}
+            checkpoint = self.db.execute(
+                "SELECT closeout_cursor FROM sleep_checkpoints WHERE profile_id=?", (profile_id,),
+            ).fetchone()
+            previous_cursor = int(checkpoint["closeout_cursor"]) if checkpoint else 0
+            if closeout_cursor < previous_cursor:
+                raise MalformedRecord("closeout_cursor cannot move backwards")
+            self.db.execute(
+                "INSERT INTO sleep_runs (profile_id, request_id, closeout_cursor, completed_at) "
+                "VALUES (?, ?, ?, ?)", (profile_id, request_id, closeout_cursor, current),
+            )
+            self.db.execute(
+                "INSERT INTO sleep_checkpoints "
+                "(profile_id, closeout_cursor, last_request_id, last_successful_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(profile_id) DO UPDATE SET "
+                "closeout_cursor=excluded.closeout_cursor, last_request_id=excluded.last_request_id, "
+                "last_successful_at=excluded.last_successful_at",
+                (profile_id, closeout_cursor, request_id, current),
+            )
+        return {**self.get_sleep_checkpoint(profile_id), "duplicate": False}
 
     def read_file(self, profile_id: str, filename: str) -> dict:
         self._require_profile(profile_id)

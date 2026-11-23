@@ -537,6 +537,23 @@ class ToolBridge:
             },
         )
 
+    def get_sleep_checkpoint(self, profile_id: str):
+        return self._request("GET", f"/profiles/{profile_id}/sleep-checkpoint")
+
+    def complete_sleep(
+        self, profile_id: str, request_id: str, closeout_cursor: int,
+        *, completed_at: float | None = None,
+    ):
+        return self._request(
+            "PUT",
+            f"/profiles/{profile_id}/sleep-checkpoint",
+            json={
+                "request_id": request_id,
+                "closeout_cursor": closeout_cursor,
+                "completed_at": completed_at,
+            },
+        )
+
     def search_memories(self, profile_id: str, query: str, limit: int = 20):
         return self._request("GET", f"/profiles/{profile_id}/memories/search",
                              params={"q": query, "limit": limit})

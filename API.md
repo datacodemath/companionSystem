@@ -112,6 +112,13 @@ subset of these operations over `POST /mcp` and `GET /mcp`; see
   invalid kind/empty content/non-string tags.
 - `DELETE /profiles/{id}/memories/{event_id}` → 204. Self-service erase,
   same `remember` grant. 404 if the event doesn't exist under that profile.
+- `GET /profiles/{id}/sleep-checkpoint` → `{profile_id, closeout_cursor,
+  last_request_id, last_successful_at}`. Requires `remember`; returns cursor
+  metadata only, never task contents.
+- `PUT /profiles/{id}/sleep-checkpoint` with `{request_id, closeout_cursor,
+  completed_at?}` commits a successful sleep after its reflection and
+  `recent_work` writes. Repeating the same request ID and cursor is idempotent;
+  conflicting retries and backwards cursors are rejected. Requires `remember`.
 
 ## Inbox (companion-to-companion messages)
 

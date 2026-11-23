@@ -121,6 +121,12 @@ class RecentWorkIn(BaseModel):
     window_end: float | None = None
 
 
+class SleepCompleteIn(BaseModel):
+    request_id: str = Field(min_length=1, max_length=128)
+    closeout_cursor: int = Field(ge=0)
+    completed_at: float | None = None
+
+
 class MessageIn(BaseModel):
     to_profile_id: str
     content: str
@@ -1160,6 +1166,23 @@ def create_app(data_dir: str = DATA_DIR, do_seed: bool = True,
             window_days=body.window_days,
             window_start=body.window_start,
             window_end=body.window_end,
+        )
+
+    @app.get("/profiles/{profile_id}/sleep-checkpoint")
+    def get_sleep_checkpoint(profile_id: str, request: Request):
+        _require("remember", profile_id, request)
+        return _wrap(store.get_sleep_checkpoint, profile_id)
+
+    @app.put("/profiles/{profile_id}/sleep-checkpoint")
+    def complete_sleep(profile_id: str, body: SleepCompleteIn, request: Request):
+        """Commit a successful sleep cursor after its other writes have completed."""
+        _require("remember", profile_id, request)
+        return _wrap(
+            store.complete_sleep,
+            profile_id,
+            body.request_id,
+            body.closeout_cursor,
+            completed_at=body.completed_at,
         )
 
     @app.patch("/profiles/{profile_id}/memories/{event_id}")
