@@ -192,5 +192,4 @@ Two distinct tasks, started under the now-superseded session override:
   exact tokens/quota unknown.
 - Routing lesson: existing uncommitted work still needs independent execution
   and acceptance; do not rely on its presence as evidence of completion.
-- Receipt: draft PR for conversation/workbench closeout classification (to be
-  linked after publication).
+- Receipt: [draft PR #3 — conversation/workbench closeout classification](https://github.com/datacodemath/companionSystem/pull/3).
