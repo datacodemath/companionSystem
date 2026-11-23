@@ -126,9 +126,7 @@ def build_invocation(store, dyn, profile_id, options, *, identity_file=None,
               'no_available_sections_declared' if requested == 'delta' and not available else None)
     warnings = []
     if effective == 'delta':
-        warnings.append('Common context availability is host-declared best effort, not verified retention. If anything is missing after compaction or host/model change, summon again with hydration=full.')
-    if session.receipt:
-        warnings.append('The supplied delivery receipt is informational; it is not used as proof of retained context or authorization.')
+        warnings.append('Some common context was omitted based on a host declaration; retention is not verified. If a needed section is missing after compaction or a host/model change, request a full summon.')
     core_keys = ('id','display_name','signature','allowed_tools','memory_policy','closeout_rules','aliases','profile_kind')
     packet = {'profile': {k:profile[k] for k in core_keys}, **store._prompt_sections(profile_id),
               'selection': {'profile_id': profile_id, 'settled': True}}

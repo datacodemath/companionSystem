@@ -647,7 +647,8 @@ def test_mcp_tool_flow_and_logging(tmp_path, caplog):
         assert removed["error"]["code"] == -32602
 
     started = _call_tool(client, "summon_companion", {"profile_id": "tara"}).json()["result"]
-    assert started["structuredContent"]["selection"]["settled"] is True
+    assert "selection" not in started["structuredContent"]
+    assert started["structuredContent"]["profile"]["id"] == "tara"
     assert started["structuredContent"]["identity"] == "Canonical identity."
     assert started["structuredContent"]["soul"] == "I collect strange questions."
     assert "thread_continuity" not in started["structuredContent"]
@@ -655,7 +656,7 @@ def test_mcp_tool_flow_and_logging(tmp_path, caplog):
     assert bridge.resolve_calls == []  # exact startup did not resolve
 
     resolved_start = _call_tool(client, "summon_companion", {"profile_id": "Tara"}).json()["result"]
-    assert resolved_start["structuredContent"]["selection"]["profile_id"] == "tara"
+    assert resolved_start["structuredContent"]["profile"]["id"] == "tara"
     assert bridge.resolve_calls == ["Tara"]
 
     removed = _call_tool(client, "update_own_description", {
@@ -785,7 +786,7 @@ def test_summon_companion_uses_exact_id_before_resolution_and_falls_back_on_404(
 
     named = _call_tool(client, "summon_companion", {"profile_id": "Tara"}).json()["result"]
     assert named["isError"] is False
-    assert named["structuredContent"]["selection"]["profile_id"] == "tara"
+    assert named["structuredContent"]["profile"]["id"] == "tara"
     assert bridge.start_session_calls == ["tara", "Tara", "tara"]
     assert bridge.resolve_calls == ["Tara"]
 

@@ -348,8 +348,63 @@ INVOCATION_SESSION = {
     "required": ["profile", "who_you_are", "signature", "lane", "voice", "what_you_do",
                  "how_you_keep_context", "selection", "server_time", "invocation", "hydration"],
 }
-START_SESSION = {"type": "object", "properties": INVOCATION_SESSION["properties"],
-                 "anyOf": [LEGACY_START_SESSION, INVOCATION_SESSION]}
+
+# MCP receives a model-facing projection. Keep the older result branches in
+# the published schema for clients that still consume the direct REST shape.
+MODEL_HYDRATION_PROFILE = {
+    "type": "object",
+    "properties": {
+        key: PROFILE["properties"][key]
+        for key in (
+            "id", "display_name", "profile_kind", "allowed_tools",
+            "memory_policy", "closeout_rules",
+        )
+    },
+    "required": [
+        "id", "display_name", "profile_kind", "allowed_tools",
+        "memory_policy", "closeout_rules",
+    ],
+}
+MODEL_HYDRATION_SESSION = {
+    "type": "object",
+    "properties": {
+        **{
+            key: value
+            for key, value in INVOCATION_SESSION["properties"].items()
+            if key not in {"selection", "hydration"}
+        },
+        "profile": MODEL_HYDRATION_PROFILE,
+        "invocation": {
+            "type": "object",
+            "properties": {
+                "mode": {"enum": ["conversation", "forum", "editor", "actor", "workbench"]},
+                "instructions": {"type": "string"},
+                "task": {"type": "object"},
+                "permissions": {"type": "string"},
+                "persistence": {"type": "string"},
+            },
+            "required": ["mode", "instructions", "task", "permissions", "persistence"],
+        },
+        "warnings": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": [
+        "profile", "who_you_are", "signature", "lane", "voice",
+        "what_you_do", "how_you_keep_context",
+    ],
+}
+START_SESSION = {
+    "type": "object",
+    "properties": {
+        **INVOCATION_SESSION["properties"],
+        "profile": {"anyOf": [HYDRATION_PROFILE, MODEL_HYDRATION_PROFILE]},
+        "invocation": {"anyOf": [
+            INVOCATION_SESSION["properties"]["invocation"],
+            MODEL_HYDRATION_SESSION["properties"]["invocation"],
+        ]},
+        "warnings": {"type": "array", "items": {"type": "string"}},
+    },
+    "anyOf": [LEGACY_START_SESSION, INVOCATION_SESSION, MODEL_HYDRATION_SESSION],
+}
 
 CONTEXT_RESULT = {
     "type": "object",
