@@ -89,7 +89,10 @@ CREATE TABLE IF NOT EXISTS recent_work (
     window_days INTEGER NOT NULL DEFAULT 7,
     window_start REAL,
     window_end REAL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    classification TEXT NOT NULL DEFAULT 'interpretation',
+    provenance_source TEXT NOT NULL DEFAULT 'legacy_unattributed',
+    provenance_refs TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
@@ -197,8 +200,24 @@ class Store:
         self.db.executescript(SCHEMA)
         self._migrate_prompt_sections()
         columns = {row["name"] for row in self.db.execute("PRAGMA table_info(closeouts)")}
+        recent_work_columns = {
+            row["name"] for row in self.db.execute("PRAGMA table_info(recent_work)")
+        }
         profile_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(profiles)")}
         with self.db:
+            # PR #1 introduced recent_work before its provenance contract. Keep
+            # those rows readable and visibly unattributed during this upgrade.
+            if "classification" not in recent_work_columns:
+                self.db.execute(
+                    "ALTER TABLE recent_work ADD COLUMN classification TEXT NOT NULL "
+                    "DEFAULT 'interpretation'")
+            if "provenance_source" not in recent_work_columns:
+                self.db.execute(
+                    "ALTER TABLE recent_work ADD COLUMN provenance_source TEXT NOT NULL "
+                    "DEFAULT 'legacy_unattributed'")
+            if "provenance_refs" not in recent_work_columns:
+                self.db.execute(
+                    "ALTER TABLE recent_work ADD COLUMN provenance_refs TEXT NOT NULL DEFAULT '[]'")
             for name in ("facts", "texture", "exchange"):
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE closeouts ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
@@ -875,7 +894,12 @@ class Store:
     SOUL_FILENAME = "SOUL.md"
     MAX_SOUL_BYTES = 16 * 1024
     MAX_RECENT_WORK_CHARS = 1000
+    MAX_RECENT_WORK_REFS = 20
+    MAX_RECENT_WORK_REF_CHARS = 128
+    _RECENT_WORK_SOURCE_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
+    _RECENT_WORK_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
     DEFAULT_RECENT_WORK_WINDOW_DAYS = 7
+    RECENT_WORK_CLASSIFICATIONS = {"activity", "interpretation", "verified_fact"}
 
     @classmethod
     def _validate_filename(cls, filename: str) -> None:
@@ -928,9 +952,19 @@ class Store:
         window_start: float | None = None,
         window_end: float | None = None,
         updated_at: float | None = None,
+        classification: str = "interpretation",
+        provenance_source: str = "caller_unspecified",
+        provenance_refs: list[str] | None = None,
     ) -> dict:
-        """Store the bounded first-person recent-work reflection compacted after dreams."""
-        self._require_profile(profile_id)
+        """Replace this companion's bounded work reflection and its audit labels.
+
+        Classification and provenance are caller-supplied evidence labels, not
+        server verification. Older callers remain valid and are marked as an
+        interpretation with an unspecified source and no source references.
+        """
+        profile = self._require_profile(profile_id)
+        if profile["profile_kind"] != "companion":
+            raise MalformedRecord("recent_work is only available to companion profiles")
         if not isinstance(content, str):
             raise MalformedRecord("recent_work content must be a string")
         clean_content = content.strip()
@@ -940,6 +974,21 @@ class Store:
             )
         if type(window_days) is not int or not 1 <= window_days <= 90:
             raise MalformedRecord("window_days must be an integer between 1 and 90")
+        if (not isinstance(classification, str)
+                or classification not in self.RECENT_WORK_CLASSIFICATIONS):
+            raise MalformedRecord("classification must be activity, interpretation, or verified_fact")
+        if (not isinstance(provenance_source, str)
+                or not self._RECENT_WORK_SOURCE_RE.fullmatch(provenance_source)):
+            raise MalformedRecord("provenance_source must be a lowercase identifier of at most 64 characters")
+        if provenance_refs is None:
+            provenance_refs = []
+        if (not isinstance(provenance_refs, list)
+                or len(provenance_refs) > self.MAX_RECENT_WORK_REFS
+                or any(not isinstance(ref, str)
+                       or len(ref) > self.MAX_RECENT_WORK_REF_CHARS
+                       or not self._RECENT_WORK_REF_RE.fullmatch(ref) for ref in provenance_refs)):
+            raise MalformedRecord("provenance_refs must contain at most 20 opaque identifiers of at most 128 characters")
+        refs = list(dict.fromkeys(provenance_refs))
         now = time.time() if updated_at is None else float(updated_at)
         eff_end = now if window_end is None else float(window_end)
         eff_start = (
@@ -950,13 +999,17 @@ class Store:
         with self.db:
             self.db.execute(
                 "INSERT INTO recent_work "
-                "(profile_id, content, window_days, window_start, window_end, updated_at) "
-                "VALUES (?,?,?,?,?,?) "
+                "(profile_id, content, window_days, window_start, window_end, updated_at, "
+                "classification, provenance_source, provenance_refs) "
+                "VALUES (?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(profile_id) DO UPDATE SET "
                 "content=excluded.content, window_days=excluded.window_days, "
                 "window_start=excluded.window_start, window_end=excluded.window_end, "
-                "updated_at=excluded.updated_at",
-                (profile_id, clean_content, window_days, eff_start, eff_end, now),
+                "updated_at=excluded.updated_at, classification=excluded.classification, "
+                "provenance_source=excluded.provenance_source, "
+                "provenance_refs=excluded.provenance_refs",
+                (profile_id, clean_content, window_days, eff_start, eff_end, now,
+                 classification, provenance_source.strip(), json.dumps(refs)),
             )
         return {
             "profile_id": profile_id,
@@ -965,11 +1018,49 @@ class Store:
             "window_start": eff_start,
             "window_end": eff_end,
             "updated_at": now,
+            "classification": classification,
+            "provenance": {"source": provenance_source.strip(), "references": refs},
+        }
+
+    def read_recent_work_metadata(self, profile_id: str, *, now: float | None = None) -> dict | None:
+        """Return bounded timestamps and provenance for conversation-only hydration."""
+        profile = self._require_profile(profile_id)
+        if profile["profile_kind"] != "companion":
+            return None
+        row = self.db.execute(
+            "SELECT content, window_days, window_start, window_end, updated_at, classification, "
+            "provenance_source, provenance_refs FROM recent_work WHERE profile_id=?",
+            (profile_id,),
+        ).fetchone()
+        if row is None or not row["content"]:
+            return None
+        current = time.time() if now is None else float(now)
+        days = max(1, int(row["window_days"] or self.DEFAULT_RECENT_WORK_WINDOW_DAYS))
+        anchor = row["window_end"] if row["window_end"] is not None else row["updated_at"]
+        if anchor is None or (current - float(anchor)) > days * 86400:
+            return None
+        try:
+            refs = json.loads(row["provenance_refs"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            refs = []
+        if not isinstance(refs, list):
+            refs = []
+        refs = [ref for ref in refs[:self.MAX_RECENT_WORK_REFS]
+                if isinstance(ref, str)
+                and self._RECENT_WORK_REF_RE.fullmatch(ref)]
+        return {
+            "classification": row["classification"],
+            "provenance": {"source": row["provenance_source"], "references": refs},
+            "window_start": row["window_start"],
+            "window_end": row["window_end"],
+            "updated_at": row["updated_at"],
         }
 
     def read_recent_work(self, profile_id: str, *, now: float | None = None) -> str:
         """Return bounded recent-work text if present and still within its time window."""
-        self._require_profile(profile_id)
+        profile = self._require_profile(profile_id)
+        if profile["profile_kind"] != "companion":
+            return ""
         row = self.db.execute(
             "SELECT content, window_days, window_end, updated_at "
             "FROM recent_work WHERE profile_id=?",

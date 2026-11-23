@@ -25,7 +25,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.routing import APIRoute
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field, field_validator
-from typing import Any
+from typing import Any, Literal
 
 from .shared_files import SharedFiles, SharedFileExists
 from .invocation import InvocationOptions, build_invocation
@@ -119,6 +119,9 @@ class RecentWorkIn(BaseModel):
     window_days: int = Field(default=7, ge=1, le=90)
     window_start: float | None = None
     window_end: float | None = None
+    classification: Literal["activity", "interpretation", "verified_fact"] = "interpretation"
+    provenance_source: str = Field(default="caller_unspecified", min_length=1, max_length=64)
+    provenance_refs: list[str] = Field(default_factory=list, max_length=20)
 
 
 class MessageIn(BaseModel):
@@ -993,6 +996,12 @@ def create_app(data_dir: str = DATA_DIR, do_seed: bool = True,
                 } if is_legacy_session_log(profile_id, item["name"]) else {}))
                 for item in _wrap(dyn.list, profile_id)
             ]
+        recent_work_fields = {}
+        if profile["profile_kind"] == "companion":
+            recent_work_fields["recent_work"] = _wrap(store.read_recent_work, profile_id)
+            metadata = _wrap(store.read_recent_work_metadata, profile_id)
+            if metadata is not None:
+                recent_work_fields["recent_work_metadata"] = metadata
         return {
             **booted,
             "system_contracts": (
@@ -1009,8 +1018,8 @@ def create_app(data_dir: str = DATA_DIR, do_seed: bool = True,
             # Append-only chronological continuity. Unlike memories and
             # few-shot exchanges, this answers what happened in recent sessions.
             "recent_session_log": _wrap(store.recent_session_log, profile_id, 5),
-            # Bounded post-dream work reflection for conversation continuity only.
-            "recent_work": _wrap(store.read_recent_work, profile_id),
+            # Bounded post-dream work reflection for companion conversations only.
+            **recent_work_fields,
             # Deliberately only a flag: inbox contents stay behind read_inbox,
             # but a newly hydrated companion knows when to check it.
             "you_got_mail": bool(_wrap(store.list_inbox, profile_id, True, 1)),
@@ -1160,6 +1169,9 @@ def create_app(data_dir: str = DATA_DIR, do_seed: bool = True,
             window_days=body.window_days,
             window_start=body.window_start,
             window_end=body.window_end,
+            classification=body.classification,
+            provenance_source=body.provenance_source,
+            provenance_refs=body.provenance_refs,
         )
 
     @app.patch("/profiles/{profile_id}/memories/{event_id}")

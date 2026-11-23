@@ -140,9 +140,12 @@ def build_invocation(store, dyn, profile_id, options, *, identity_file=None,
         packet['compact_state'] = booted['compact_state']
         packet['memories'] = [{'kind':e['kind'],'content':e['content']} for e in booted['recent_memories']]
         packet['recent_exchanges'] = store.recent_exchanges(profile_id,4)
-        if mode == 'conversation':
+        if mode == 'conversation' and profile['profile_kind'] == 'companion':
             packet['recent_session_log'] = store.recent_session_log(profile_id,5)
             packet['recent_work'] = store.read_recent_work(profile_id)
+            recent_work_metadata = store.read_recent_work_metadata(profile_id)
+            if recent_work_metadata is not None:
+                packet['recent_work_metadata'] = recent_work_metadata
         packet['you_got_mail'] = bool(store.list_inbox(profile_id,True,1))
         if can_read_records:
             packet['data_sources'] = {'profile_stores': [

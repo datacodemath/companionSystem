@@ -262,6 +262,26 @@ START_SESSION = {
             "required": ["date", "summary", "notes"],
         }),
         "recent_work": {"type": "string", "maxLength": 1000},
+        "recent_work_metadata": {
+            "type": "object",
+            "properties": {
+                "classification": {"type": "string", "enum": ["activity", "interpretation", "verified_fact"]},
+                "provenance": {
+                    "type": "object",
+                    "properties": {
+                        "source": {"type": "string", "maxLength": 64},
+                        "references": {"type": "array", "maxItems": 20, "items": {"type": "string", "maxLength": 128}},
+                    },
+                    "required": ["source", "references"],
+                    "additionalProperties": False,
+                },
+                "window_start": {"type": ["number", "null"]},
+                "window_end": {"type": ["number", "null"]},
+                "updated_at": {"type": "number"},
+            },
+            "required": ["classification", "provenance", "window_start", "window_end", "updated_at"],
+            "additionalProperties": False,
+        },
         "you_got_mail": {"type": "boolean"},
         "selection": {
             "type": "object",

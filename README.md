@@ -24,6 +24,28 @@ Data is deliberately simple and inspectable: SQLite for application data,
 Markdown files for prompts, JSONL closeout logs, and plain files under the
 configured data directory.
 
+### Recent work continuity
+
+Sleep consolidation can replace one current `recent_work` snapshot per
+companion through `PUT /profiles/{profile_id}/recent-work` (the caller needs
+that profile's `remember` grant). The bounded summary is independent of
+conversation closeouts and is exposed as `recent_work` only in conversational
+hydration. Its companion-only `recent_work_metadata` carries the update time,
+covered time window, a classification (`activity`, `interpretation`, or
+`verified_fact`), and bounded provenance (`source` plus up to 20 opaque task
+receipt or task-closeout references; arbitrary text and URLs are rejected).
+Workbench/editor/actor/forum hydration does not receive this snapshot or its
+metadata.
+
+Classification and provenance are claims supplied by the writer. In
+particular, `verified_fact` means the writer labels the summary that way; this
+service does not verify its evidence. Missing classifications from older
+callers default to `interpretation`; missing sources default to
+`caller_unspecified`. Existing `recent_work` rows migrate with the
+`legacy_unattributed` provenance label and remain readable. The endpoint
+replaces the current snapshot; it does not create a transcript or a version
+history.
+
 The optional Ironsworn rules surface exposes indexed Lodestar move and oracle
 text, plus Oak's editable sheet, through the read-only
 `get_ironsworn_resource` MCP tool. The generated Markdown corpus lives in the

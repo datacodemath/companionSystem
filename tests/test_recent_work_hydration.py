@@ -89,6 +89,7 @@ def test_mode_separation_conversation_and_secondary_get_recent_work_while_task_m
     forum = runner.call("summon_companion", {"profile_id": "limo", "mode": "forum"})
     _validate(forum)
     assert "recent_work" not in forum
+    assert "recent_work_metadata" not in forum
 
     # Focused / non-conversation invocation modes must not even read recent_work.
     def forbidden(*args, **kwargs):
@@ -253,3 +254,107 @@ def test_recent_work_auth_and_dream_to_conversation_integration(tmp_path):
         assert "recent_work" not in task_packet
         assert task_packet["invocation"]["task"]["purpose"] == "Verify task mode"
         db.close()
+
+
+def test_recent_work_metadata_is_companion_scoped_updated_and_conversation_only(env):
+    app, client, bridge, runner = env
+    store = app.state.store
+    store.create_profile("tara", "Tara", "I am Tara.", "Coordinate work.")
+    store.create_profile("daemon", "Daemon", "Service identity.", "No conversation.", profile_kind="system")
+    first = store.set_recent_work(
+        "limo",
+        "I have been working on: queue route isolation.",
+        classification="activity",
+        provenance_source="sleep_consolidation",
+        provenance_refs=["task-closeout:41", "task:relay-7"],
+    )
+    # Updating the snapshot replaces its classification and provenance in place.
+    second = bridge.set_recent_work(
+        "limo",
+        "I have been working on: the route-isolation tests passed.",
+        classification="verified_fact",
+        provenance_source="sleep_consolidation",
+        provenance_refs=["test-run:pytest-52"],
+    )
+    assert second["updated_at"] >= first["updated_at"]
+    assert second["classification"] == "verified_fact"
+    assert second["provenance"]["references"] == ["test-run:pytest-52"]
+    assert store.db.execute(
+        "SELECT COUNT(*) FROM recent_work WHERE profile_id='limo'"
+    ).fetchone()[0] == 1
+
+    packet = runner.call("summon_companion", {"profile_id": "limo", "mode": "conversation"})
+    _validate(packet)
+    assert packet["recent_work"] == second["content"]
+    assert packet["recent_work_metadata"]["classification"] == "verified_fact"
+    assert packet["recent_work_metadata"]["provenance"]["references"] == ["test-run:pytest-52"]
+    assert packet["recent_work_metadata"]["updated_at"] == second["updated_at"]
+
+    # A different companion has no access to Limo's private summary.
+    tara_packet = runner.call("summon_companion", {"profile_id": "tara", "mode": "conversation"})
+    _validate(tara_packet)
+    assert tara_packet["recent_work"] == ""
+    assert "recent_work_metadata" not in tara_packet
+
+    workbench = runner.call(
+        "summon_companion",
+        {"profile_id": "limo", "mode": "workbench", "task": {"purpose": "Inspect only"}},
+    )
+    _validate(workbench)
+    assert "recent_work" not in workbench
+    assert "recent_work_metadata" not in workbench
+
+    forum = runner.call("summon_companion", {"profile_id": "limo", "mode": "forum"})
+    _validate(forum)
+    assert "recent_work" not in forum
+    assert "recent_work_metadata" not in forum
+
+    from profile_os.errors import MalformedRecord
+    with pytest.raises(MalformedRecord):
+        store.set_recent_work("daemon", "should not persist")
+    daemon_packet = runner.call("summon_companion", {"profile_id": "daemon", "mode": "conversation"})
+    _validate(daemon_packet)
+    assert "recent_work" not in daemon_packet
+    assert "recent_work_metadata" not in daemon_packet
+
+    # Both direct storage and the safe update API enforce bounded provenance.
+    bounded = store.set_recent_work(
+        "limo",
+        "x" * Store.MAX_RECENT_WORK_CHARS,
+        provenance_refs=[f"task:{index}" for index in range(Store.MAX_RECENT_WORK_REFS)],
+    )
+    bounded_metadata = store.read_recent_work_metadata("limo")
+    assert len(bounded["content"]) == Store.MAX_RECENT_WORK_CHARS
+    assert len(bounded_metadata["provenance"]["references"]) == Store.MAX_RECENT_WORK_REFS
+    with pytest.raises(MalformedRecord):
+        store.set_recent_work("limo", "x", provenance_refs=["ref"] * 21)
+    with pytest.raises(MalformedRecord):
+        store.set_recent_work("limo", "x", provenance_refs=["arbitrary user text"])
+    assert client.put(
+        "/profiles/limo/recent-work",
+        json={"content": "x", "provenance_refs": ["ref"] * 21},
+    ).status_code == 422
+
+
+def test_recent_work_migrates_legacy_rows_without_losing_text_or_window(tmp_path):
+    data_dir = tmp_path / "legacy-data"
+    old_store = Store(data_dir)
+    old_store.create_profile("legacy", "Legacy", "Identity", "Work")
+    written = old_store.set_recent_work("legacy", "I have been working on: old summary.")
+    # Simulate the table as it existed in PR #1 before provenance columns.
+    for column in ("classification", "provenance_source", "provenance_refs"):
+        old_store.db.execute(f"ALTER TABLE recent_work DROP COLUMN {column}")
+    old_store.db.commit()
+    old_store.close()
+
+    migrated = Store(data_dir)
+    try:
+        assert migrated.read_recent_work("legacy", now=written["updated_at"] + 60) == written["content"]
+        metadata = migrated.read_recent_work_metadata("legacy", now=written["updated_at"] + 60)
+        assert metadata["classification"] == "interpretation"
+        assert metadata["provenance"] == {
+            "source": "legacy_unattributed",
+            "references": [],
+        }
+    finally:
+        migrated.close()

@@ -525,6 +525,9 @@ class ToolBridge:
         window_days: int = 7,
         window_start: float | None = None,
         window_end: float | None = None,
+        classification: str = "interpretation",
+        provenance_source: str = "sleep_consolidation",
+        provenance_refs: list[str] | None = None,
     ):
         return self._request(
             "PUT",
@@ -534,6 +537,9 @@ class ToolBridge:
                 "window_days": window_days,
                 "window_start": window_start,
                 "window_end": window_end,
+                "classification": classification,
+                "provenance_source": provenance_source,
+                "provenance_refs": provenance_refs or [],
             },
         )
 
