@@ -427,6 +427,7 @@ def _session_inspector_page(profiles: list[dict], *, selected_id: str = "",
             output += block("Memories", "Mutable context, newest first. Tags and database IDs are intentionally hidden here; use the raw payload for lookup fields.", memory_context)
             output += block("Recent session log", "Append-only chronological handoffs, newest first and bounded to five entries.", result.get("recent_session_log"))
             output += block("Recent work", "Bounded first-person work reflection compacted after dreams for conversation hydration; omitted in task/forum/editor/actor modes.", result.get("recent_work"))
+            output += block("Recent work provenance", "Writer-supplied activity classification, source references, and timestamps; a verified_fact label is not independently checked by this service.", result.get("recent_work_metadata"))
             output += block("Data sources", "Profile stores and shared projects this companion may use in this session.", result.get("data_sources"))
             output += block("Companion directory", "The current companion cast; it does not include private context.", result.get("companion_directory"))
     return f"""<!doctype html>
@@ -1805,7 +1806,7 @@ class MCPToolRunner:
         # Session autobiography belongs to human conversations. Autonomous
         # forum wakes receive their bounded Thread continuity instead.
         session = {key: value for key, value in session.items()
-                   if key not in {"recent_session_log", "recent_work"}}
+                   if key not in {"recent_session_log", "recent_work", "recent_work_metadata"}}
         profile_id = session["selection"]["profile_id"]
         rows = self.bridge.query_records(
             profile_id, "thread_continuity", limit=200)

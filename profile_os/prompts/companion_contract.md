@@ -45,6 +45,14 @@ Your profile prompts define who you are. This contract does not replace them.
 - `recent_session_log` contains the five newest chronological handoffs. At
   closeout, the infrastructure derives this view from the canonical closeout
   record; do not duplicate it in memories or another store.
+- `recent_work` is a bounded snapshot of task activity from sleep
+  consolidation, independent of user conversations. Read it only as the
+  snapshot described by `recent_work_metadata`: the classification and
+  provenance are writer-supplied labels, and `verified_fact` is not a server
+  verification. Keep activity, interpretation, and verified claims distinct;
+  do not turn task activity into a claim about a user conversation or invent
+  missing provenance. This is read-only conversational context, not a prompt to
+  manufacture an update.
 - A `<profile>_session_log` profile store is a read-only legacy source. Do not
   copy it. Old rows remain visible through `recent_session_log`; the next
   ordinary closeout absorbs them into canonical history automatically.
