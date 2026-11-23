@@ -12,7 +12,8 @@ from profile_os.bootstrap_bridge import BRIDGE_OPS, bootstrap
 from profile_os.access import AccessControl
 from profile_os.bridge import ToolBridge, ToolBridgeError
 from profile_os.mcp_server import (
-    MCPSettings, MCP_TOOLS, OAuthState, _redirect_host_allowed, _tool_result, create_mcp_app,
+    CloseoutCodeState, MCPSettings, MCP_TOOLS, MCPToolRunner, OAuthState,
+    _redirect_host_allowed, _tool_result, create_mcp_app,
 )
 from profile_os.request_limits import DEFAULT_MAX_REQUEST_BYTES
 from profile_os.storage import Store
@@ -94,6 +95,7 @@ class FakeBridge:
         self.start_session_calls = []
         self.resolve_calls = []
         self.closeout_calls = []
+        self.workbench_closeout_calls = []
 
     def list_profiles(self):
         return [
@@ -251,11 +253,16 @@ class FakeBridge:
             "instructions": ["Review records, then memories, then close out."],
         }
 
-    def closeout(self, profile_id, facts, texture, exchange, notes=""):
-        self.closeout_calls.append((profile_id, facts, texture, exchange, notes))
+    def closeout(self, profile_id, facts, texture, exchange, notes="", closeout_type="conversation"):
+        self.closeout_calls.append((profile_id, facts, texture, exchange, notes, closeout_type))
         return {"id": "closeout-1", "profile_id": profile_id,
                 "facts": facts, "texture": texture, "exchange": exchange,
-                "notes": notes, "new_state": facts, "created_at": 1}
+                "notes": notes, "new_state": facts, "closeout_type": closeout_type,
+                "created_at": 1}
+
+    def list_workbench_closeouts(self, profile_id, **kwargs):
+        self.workbench_closeout_calls.append((profile_id, kwargs))
+        return {"items": [], "next_cursor": None}
 
     def list_stores(self, profile_id):
         return list(self.stores.values())
@@ -444,7 +451,7 @@ def test_initialize_and_list_tools(tmp_path, monkeypatch):
     assert r.status_code == 200
     tools = r.json()["result"]["tools"]
     names = {tool["name"] for tool in tools}
-    assert len(names) == 30
+    assert len(names) == 31
     assert {"closeout", "search_memories",
             "set_messages_read_status"} <= names
     assert not names & {"whoami", "resolve_companion", "list_profiles",
@@ -472,11 +479,14 @@ def test_initialize_and_list_tools(tmp_path, monkeypatch):
     assert discover["annotations"]["readOnlyHint"] is True
     closeout = next(tool for tool in tools if tool["name"] == "closeout")
     assert set(closeout["inputSchema"]["properties"]) == {
-        "profile_id", "code", "facts", "texture", "exchange", "notes",
+        "profile_id", "code", "facts", "texture", "exchange", "notes", "closeout_type",
     }
     assert closeout["inputSchema"]["required"] == []
     assert closeout["inputSchema"]["properties"]["notes"]["maxLength"] == 700
     assert "rapport" in closeout["inputSchema"]["properties"]["texture"]["description"]
+    workbench_closeouts = next(tool for tool in tools if tool["name"] == "list_workbench_closeouts")
+    assert workbench_closeouts["annotations"]["readOnlyHint"] is True
+    assert workbench_closeouts["inputSchema"]["properties"]["cursor"]["type"] == "string"
     annotations = {tool["name"]: tool["annotations"] for tool in tools}
     assert annotations["forget"]["destructiveHint"] is True
     assert annotations["delete_file"]["destructiveHint"] is True
@@ -500,7 +510,7 @@ def test_list_tools_can_omit_output_schemas(tmp_path, monkeypatch):
     r = client.post("/mcp", json=_rpc("tools/list"), headers=_bearer())
     assert r.status_code == 200
     tools = r.json()["result"]["tools"]
-    assert len(tools) == 30
+    assert len(tools) == 31
     for tool in tools:
         assert set(tool) == {"name", "title", "description", "inputSchema", "annotations"}
 
@@ -531,6 +541,14 @@ def test_closeout_is_two_phase_profile_bound_single_use_and_retriable_on_failure
     }).json()["result"]["structuredContent"]
     assert completed["phase"] == "closed"
     assert bridge.closeout_calls[-1][0] == "tara"
+    assert bridge.closeout_calls[-1][-1] == "conversation"
+
+    workbench_prepared = _call_tool(client, "closeout", {"profile_id": "tara"}).json()["result"]["structuredContent"]
+    workbench = _call_tool(client, "closeout", {
+        "code": workbench_prepared["code"], "facts": "task handoff", "texture": "n/a",
+        "exchange": "agent output", "closeout_type": "workbench",
+    }).json()["result"]["structuredContent"]
+    assert workbench["closeout"]["closeout_type"] == "workbench"
 
     replay = _call_tool(client, "closeout", {
         "code": prepared["code"], "facts": "f", "texture": "t", "exchange": "x",
@@ -571,6 +589,23 @@ def test_closeout_is_two_phase_profile_bound_single_use_and_retriable_on_failure
     }).json()["result"]
     assert expired["isError"] is True
     assert "expired" in expired["content"][0]["text"]
+
+
+def test_list_workbench_closeouts_mcp_dispatch_preserves_time_and_cursor_filters():
+    bridge = FakeBridge()
+    runner = MCPToolRunner(
+        bridge,
+        closeout_signing_key="test",
+        closeout_code_state=CloseoutCodeState(":memory:"),
+    )
+    page = runner.call("list_workbench_closeouts", {
+        "profile_id": "tara", "since": 100.0, "until": 200.0,
+        "cursor": "next-page", "limit": 7,
+    })
+    assert page == {"items": [], "next_cursor": None}
+    assert bridge.workbench_closeout_calls == [(
+        "tara", {"since": 100.0, "until": 200.0, "cursor": "next-page", "limit": 7},
+    )]
 
 
 @pytest.mark.parametrize("arguments", [

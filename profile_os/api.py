@@ -25,7 +25,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.routing import APIRoute
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field, field_validator
-from typing import Any
+from typing import Any, Literal
 
 from .shared_files import SharedFiles, SharedFileExists
 from .invocation import InvocationOptions, build_invocation
@@ -155,6 +155,7 @@ class CloseoutIn(BaseModel):
     texture: str
     exchange: str
     notes: str = ""
+    closeout_type: Literal["conversation", "workbench"] = "conversation"
 
 
 class DomainRecordIn(BaseModel):
@@ -1305,7 +1306,27 @@ def create_app(data_dir: str = DATA_DIR, do_seed: bool = True,
     def closeout(profile_id: str, body: CloseoutIn, request: Request):
         _require("closeout", profile_id, request)
         return _wrap(store.closeout, profile_id, body.facts, body.texture,
-                     body.exchange, body.notes)
+                     body.exchange, body.notes, body.closeout_type)
+
+    @app.get("/profiles/{profile_id}/closeouts/workbench")
+    def list_workbench_closeouts(
+        profile_id: str,
+        request: Request,
+        since: float | None = Query(default=None),
+        until: float | None = Query(default=None),
+        cursor: str | None = Query(default=None, max_length=512),
+        limit: int = Query(default=20, ge=1, le=100),
+    ):
+        """Read only agentic closeouts for sleep consolidation, never dialog history."""
+        _require("search", profile_id, request)
+        return _wrap(
+            store.list_workbench_closeouts,
+            profile_id,
+            since=since,
+            until=until,
+            cursor=cursor,
+            limit=limit,
+        )
 
     # -- shared projects ------------------------------------------------------
 

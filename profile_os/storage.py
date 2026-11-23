@@ -16,8 +16,10 @@ Layout (under a data directory, default ./data):
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import math
 import re
 import shutil
 import sqlite3
@@ -76,6 +78,8 @@ CREATE INDEX IF NOT EXISTS idx_domain ON domain_records(profile_id, store);
 CREATE TABLE IF NOT EXISTS closeouts (
     id TEXT PRIMARY KEY,
     profile_id TEXT NOT NULL REFERENCES profiles(id),
+    closeout_type TEXT NOT NULL DEFAULT 'conversation'
+        CHECK (closeout_type IN ('conversation', 'workbench')),
     notes TEXT NOT NULL,
     facts TEXT NOT NULL DEFAULT '',
     texture TEXT NOT NULL DEFAULT '',
@@ -194,6 +198,13 @@ class Store:
             for name in ("facts", "texture", "exchange"):
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE closeouts ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+            if "closeout_type" not in columns:
+                self.db.execute(
+                    "ALTER TABLE closeouts ADD COLUMN closeout_type TEXT NOT NULL "
+                    "DEFAULT 'conversation' CHECK (closeout_type IN ('conversation', 'workbench'))")
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_closeouts_profile_type_page "
+                "ON closeouts(profile_id, closeout_type, created_at DESC, id DESC)")
             if "signature" not in profile_columns:
                 self.db.execute("ALTER TABLE profiles ADD COLUMN signature TEXT NOT NULL DEFAULT ''")
             if "profile_kind" not in profile_columns:
@@ -529,7 +540,8 @@ class Store:
     def recent_closeouts(self, profile_id: str, limit: int = 2) -> list[dict]:
         self._require_profile(profile_id)
         rows = self.db.execute(
-            "SELECT * FROM closeouts WHERE profile_id=? ORDER BY created_at DESC LIMIT ?",
+            "SELECT * FROM closeouts WHERE profile_id=? AND closeout_type='conversation' "
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
             (profile_id, limit)).fetchall()
         return [{"id": r["id"], "notes": r["notes"], "new_state": r["new_state"],
                  "created_at": r["created_at"]} for r in rows]
@@ -544,8 +556,8 @@ class Store:
         self._require_profile(profile_id)
         rows = self.db.execute(
             "SELECT texture, exchange FROM closeouts WHERE profile_id=? "
-            "AND texture <> '' AND exchange <> '' "
-            "ORDER BY created_at DESC LIMIT ?", (profile_id, limit)
+            "AND closeout_type='conversation' AND texture <> '' AND exchange <> '' "
+            "ORDER BY created_at DESC, id DESC LIMIT ?", (profile_id, limit)
         ).fetchall()
         return [
             {"texture": row["texture"], "exchange": row["exchange"]}
@@ -880,7 +892,7 @@ class Store:
         return [self._event_dict(r) for r in rows]
 
     def search_closeouts(self, profile_id: str, query: str, limit: int = 20) -> list[dict]:
-        """Search the canonical archive on demand, never through hydration.
+        """Search conversational closeouts on demand, never through hydration.
 
         Old rows may only have new_state/notes; migrated legacy session rows
         live in this same table. The advisory JSONL mirror is not another
@@ -895,7 +907,7 @@ class Store:
         like = f"%{literal}%"
         rows = self.db.execute(
             "SELECT id, profile_id, facts, texture, exchange, notes, new_state, created_at "
-            "FROM closeouts WHERE profile_id=? AND ("
+            "FROM closeouts WHERE profile_id=? AND closeout_type='conversation' AND ("
             "facts LIKE ? ESCAPE '\\' COLLATE NOCASE OR "
             "texture LIKE ? ESCAPE '\\' COLLATE NOCASE OR "
             "exchange LIKE ? ESCAPE '\\' COLLATE NOCASE OR "
@@ -907,9 +919,11 @@ class Store:
         return [dict(row) for row in rows]
 
     def closeout(self, profile_id: str, facts: str, texture: str, exchange: str,
-                 notes: str = "") -> dict:
+                 notes: str = "", closeout_type: str = "conversation") -> dict:
         """End a session; this one record drives every continuity projection."""
         self._require_profile(profile_id)
+        if closeout_type not in {"conversation", "workbench"}:
+            raise MalformedRecord("closeout_type must be conversation or workbench")
         fields = {"facts": facts, "texture": texture, "exchange": exchange}
         limits = {"facts": 1200, "texture": 700, "exchange": 800, "notes": 700}
         for name, value in {**fields, "notes": notes}.items():
@@ -924,13 +938,17 @@ class Store:
         cid = str(uuid.uuid4())
         now = time.time()
         with self.db:
-            self._migrate_legacy_session_log(profile_id)
+            if closeout_type == "conversation":
+                self._migrate_legacy_session_log(profile_id)
             self.db.execute(
-                "INSERT INTO closeouts (id, profile_id, notes, facts, texture, exchange, new_state, created_at)"
-                " VALUES (?,?,?,?,?,?,?,?)", (cid, profile_id, notes, facts, texture, exchange, new_state, now))
-            self.db.execute(
-                "UPDATE compact_state SET state=?, updated_at=? WHERE profile_id=?",
-                (new_state, now, profile_id))
+                "INSERT INTO closeouts "
+                "(id, profile_id, closeout_type, notes, facts, texture, exchange, new_state, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (cid, profile_id, closeout_type, notes, facts, texture, exchange, new_state, now))
+            if closeout_type == "conversation":
+                self.db.execute(
+                    "UPDATE compact_state SET state=?, updated_at=? WHERE profile_id=?",
+                    (new_state, now, profile_id))
         # The DB transaction above is the sole definition of "closeout
         # happened". The jsonl file is an advisory mirror for inspection only,
         # so nothing on this append path may propagate: doing so would 500 a
@@ -939,17 +957,86 @@ class Store:
         # lives inside the guard too, and the guard is `except Exception` on
         # purpose -- the mirror must never change a committed closeout's outcome
         # whatever the cause (a serialization raise no less than a disk error).
-        try:
-            line = json.dumps({"id": cid, "facts": facts, "texture": texture,
-                               "exchange": exchange, "notes": notes, "new_state": new_state, "at": now})
-            with open(self.profiles_dir / profile_id / "closeouts.jsonl", "a") as f:
-                f.write(line + "\n")
-        except Exception:
-            logging.getLogger(__name__).warning(
-                "closeout jsonl mirror write failed for profile %s (closeout id %s), "
-                "DB is source of truth", profile_id, cid, exc_info=True)
+        if closeout_type == "conversation":
+            try:
+                line = json.dumps({"id": cid, "closeout_type": closeout_type, "facts": facts,
+                                   "texture": texture, "exchange": exchange, "notes": notes,
+                                   "new_state": new_state, "at": now})
+                with open(self.profiles_dir / profile_id / "closeouts.jsonl", "a") as f:
+                    f.write(line + "\n")
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "closeout jsonl mirror write failed for profile %s (closeout id %s), "
+                    "DB is source of truth", profile_id, cid, exc_info=True)
         return {"id": cid, "profile_id": profile_id, "facts": facts, "texture": texture,
-                "exchange": exchange, "notes": notes, "new_state": new_state, "created_at": now}
+                "exchange": exchange, "notes": notes, "new_state": new_state,
+                "closeout_type": closeout_type, "created_at": now}
+
+    @staticmethod
+    def _encode_closeout_cursor(created_at: float, closeout_id: str) -> str:
+        payload = json.dumps([created_at, closeout_id], separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def _decode_closeout_cursor(cursor: str) -> tuple[float, str]:
+        try:
+            if not isinstance(cursor, str) or not cursor or len(cursor) > 512:
+                raise ValueError
+            raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+            created_at, closeout_id = json.loads(raw.decode("utf-8"))
+            if (isinstance(created_at, bool) or not isinstance(created_at, (int, float))
+                    or not math.isfinite(created_at) or not isinstance(closeout_id, str)
+                    or not closeout_id or len(closeout_id) > 128):
+                raise ValueError
+            return float(created_at), closeout_id
+        except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+            raise MalformedRecord("closeout cursor is invalid") from None
+
+    def list_workbench_closeouts(
+        self,
+        profile_id: str,
+        *,
+        since: float | None = None,
+        until: float | None = None,
+        cursor: str | None = None,
+        limit: int = 20,
+    ) -> dict:
+        """List only non-conversational closeouts in a time window with stable paging."""
+        self._require_profile(profile_id)
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+            raise MalformedRecord("closeout page limit must be between 1 and 100")
+        for name, value in (("since", since), ("until", until)):
+            if (value is not None and (isinstance(value, bool)
+                    or not isinstance(value, (int, float)) or not math.isfinite(value))):
+                raise MalformedRecord(f"closeout {name} must be a finite timestamp")
+        if since is not None and until is not None and since > until:
+            raise MalformedRecord("closeout since must not be after until")
+
+        clauses = ["profile_id=?", "closeout_type='workbench'"]
+        params: list[object] = [profile_id]
+        if since is not None:
+            clauses.append("created_at>=?")
+            params.append(float(since))
+        if until is not None:
+            clauses.append("created_at<?")
+            params.append(float(until))
+        if cursor is not None:
+            cursor_time, cursor_id = self._decode_closeout_cursor(cursor)
+            clauses.append("(created_at<? OR (created_at=? AND id<?))")
+            params.extend([cursor_time, cursor_time, cursor_id])
+        rows = self.db.execute(
+            "SELECT id, profile_id, closeout_type, facts, texture, exchange, notes, new_state, created_at "
+            "FROM closeouts WHERE " + " AND ".join(clauses) +
+            " ORDER BY created_at DESC, id DESC LIMIT ?",
+            (*params, limit + 1),
+        ).fetchall()
+        has_more = len(rows) > limit
+        page = rows[:limit]
+        return {
+            "items": [dict(row) for row in page],
+            "next_cursor": (self._encode_closeout_cursor(page[-1]["created_at"], page[-1]["id"])
+                            if has_more and page else None),
+        }
 
     def _migrate_legacy_session_log(self, profile_id: str) -> None:
         """Absorb valid legacy rows inside the next ordinary closeout transaction."""
@@ -1002,7 +1089,8 @@ class Store:
             raise MalformedRecord("session log limit must be between 1 and 20")
         rows = self.db.execute(
             "SELECT facts, texture, exchange, notes, created_at FROM closeouts "
-            "WHERE profile_id=? ORDER BY created_at DESC LIMIT ?",
+            "WHERE profile_id=? AND closeout_type='conversation' "
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
             (profile_id, limit),
         ).fetchall()
         entries = [{

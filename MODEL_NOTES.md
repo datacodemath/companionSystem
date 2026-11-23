@@ -176,3 +176,20 @@ Two distinct tasks, started under the now-superseded session override:
   helpers used by read-only dispatch. Synthetic success is local acceptance,
   not proof of provider credentials, model quality, voice, or deployment.
 - Receipt: [backend acceptance](ops/tamagochi/2026-10-17-runtime-review.md).
+
+## 2026-11-23 — Codex orchestration / conversation-agentic closeouts
+
+- Resumed and verified thread `01a205b2-74f6-78d2-b03b-4f2a1329e5cd` in the
+  specified worktree. The CLI reported the stored session model as
+  `gpt-6-luna` and its active default as `gpt-6.2-sol`; exact task execution
+  model/effort and token/quota telemetry are unknown.
+- No implementation worker used. Existing cross-layer changes were reviewed;
+  MCP dispatch test imports were repaired, and the output schema now requires
+  the explicit closeout type. Initial focused run found the missing imports;
+  corrected run passed 79 tests, with API/search regression passing 49 more.
+- Outcome: locally accepted with direct repair; no production migration,
+  backfill, deployment, or external service change. Review/rescue minutes and
+  exact tokens/quota unknown.
+- Routing lesson: existing uncommitted work still needs independent execution
+  and acceptance; do not rely on its presence as evidence of completion.
+- Receipt: [draft PR #3 — conversation/workbench closeout classification](https://github.com/datacodemath/companionSystem/pull/3).

@@ -199,10 +199,20 @@ CLOSEOUT = {
         "texture": {"type": "string"},
         "exchange": {"type": "string"},
         "new_state": {"type": "string"},
+        "closeout_type": {"type": "string", "enum": ["conversation", "workbench"]},
         "created_at": {"type": "number"},
     },
     "required": ["id", "profile_id", "notes", "facts", "texture", "exchange",
-                 "new_state", "created_at"],
+                 "new_state", "closeout_type", "created_at"],
+}
+
+WORKBENCH_CLOSEOUT_PAGE = {
+    "type": "object",
+    "properties": {
+        "items": array_of(CLOSEOUT),
+        "next_cursor": STRING_OR_NULL,
+    },
+    "required": ["items", "next_cursor"],
 }
 
 BOOT = {

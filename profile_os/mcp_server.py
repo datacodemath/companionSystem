@@ -70,6 +70,7 @@ from .tool_schemas import (
     QUEUE_TASK_RECEIPT,
     SHARED_DEFS,
     START_SESSION,
+    WORKBENCH_CLOSEOUT_PAGE,
     mcp_items,
 )
 
@@ -447,6 +448,7 @@ MCP_OUTPUT_SCHEMAS = {
     "remember": MEMORY_EVENT,
     "search_memories": mcp_items(MEMORY_EVENT),
     "search_context": mcp_items(CONTEXT_RESULT),
+    "list_workbench_closeouts": WORKBENCH_CLOSEOUT_PAGE,
     "update_memory": MEMORY_EVENT,
     "forget": DELETED_MEMORY,
     "send_message": MESSAGE,
@@ -480,7 +482,7 @@ _READ_ONLY_TOOLS = {
     "resolve_companion", "discover_companions", "summon_companion", "search_memories", "search_context",
     "read_inbox", "list_files", "read_file", "get_ironsworn_resource",
     "list_stores", "query_records", "get_record", "list_shared_files", "read_shared_file",
-    "get_task",
+    "get_task", "list_workbench_closeouts",
 }
 _OPEN_WORLD_TOOLS = {"send_message"}
 _DESTRUCTIVE_TOOLS = {"forget", "delete_file", "delete_record"}
@@ -589,6 +591,20 @@ MCP_TOOLS = [
             "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
         },
         ["profile_id", "query"],
+    ),
+    _tool(
+        "list_workbench_closeouts",
+        "List Workbench Closeouts",
+        "List non-conversational workbench closeouts for later sleep consolidation. "
+        "Results are profile-scoped, time-bounded, cursor-paginated, and exclude conversation history.",
+        {
+            "profile_id": _PROFILE_ID,
+            "since": {"type": "number", "description": "Inclusive Unix timestamp lower bound."},
+            "until": {"type": "number", "description": "Exclusive Unix timestamp upper bound."},
+            "cursor": {"type": "string", "maxLength": 512, "description": "Opaque next_cursor returned by the prior page."},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+        },
+        ["profile_id"],
     ),
     _tool(
         "update_memory",
@@ -729,6 +745,7 @@ MCP_TOOLS = [
         "Close Out",
         "Call with only profile_id to prepare a closeout and receive a one-time code. "
         "Then call again with code, facts, texture, exchange, and optional notes to persist it. "
+        "Set closeout_type=workbench for an agentic handoff; omitted defaults to conversation. "
         "The code is profile-bound, expires in 30 minutes, and is single-use.",
         {
             "profile_id": _PROFILE_ID,
@@ -739,6 +756,11 @@ MCP_TOOLS = [
             "exchange": {"type": "string", "maxLength": 800,
                          "description": "Verbatim 1–3-turn excerpt; never paraphrase or paste a transcript."},
             "notes": {"type": "string", "maxLength": 700, "default": ""},
+            "closeout_type": {
+                "type": "string", "enum": ["conversation", "workbench"],
+                "default": "conversation",
+                "description": "Use workbench for agentic task handoffs; omitted means conversation.",
+            },
         },
         [],
     ),
@@ -1426,6 +1448,7 @@ class MCPToolRunner:
                 arguments["texture"],
                 arguments["exchange"],
                 arguments.get("notes", ""),
+                arguments.get("closeout_type", "conversation"),
             )
         except Exception:
             self._closeout_code_state.release(digest)
@@ -1600,6 +1623,14 @@ class MCPToolRunner:
                 arguments["query"],
                 limit=int(arguments.get("limit", 20)),
             )
+        if name == "list_workbench_closeouts":
+            return self.bridge.list_workbench_closeouts(
+                arguments["profile_id"],
+                since=arguments.get("since"),
+                until=arguments.get("until"),
+                cursor=arguments.get("cursor"),
+                limit=int(arguments.get("limit", 20)),
+            )
         if name == "update_memory":
             return self.bridge.update_memory(
                 arguments["profile_id"],
@@ -1663,7 +1694,7 @@ class MCPToolRunner:
             if keys == {"profile_id"}:
                 return self._prepare_closeout(arguments["profile_id"])
             completion_required = {"code", "facts", "texture", "exchange"}
-            completion_allowed = completion_required | {"notes"}
+            completion_allowed = completion_required | {"notes", "closeout_type"}
             if completion_required <= keys and keys <= completion_allowed:
                 return self._complete_closeout(arguments)
             raise ToolBridgeError(
