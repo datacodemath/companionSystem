@@ -149,10 +149,23 @@ belong as a structured dynamic-store record.
 - `DELETE /profiles/{id}/files/{filename}` → 204. Requires `remember`; 404
   if it doesn't exist.
 
-- ★ `POST /profiles/{id}/closeout` — end session. Body:
+- ★ `POST /profiles/{id}/closeout` — save a closeout. Body:
   `{"facts": "durable session facts", "texture": "concrete rapport/tone cues",
-  "exchange": "short verbatim meaningful excerpt", "notes": "optional audit note"}` → 201.
-  Replaces compact state and appends to `closeouts.jsonl`.
+  "exchange": "short verbatim meaningful excerpt", "notes": "optional audit note",
+  "closeout_type": "conversation"}` → 201. `closeout_type` is optional and
+  defaults to `conversation`, preserving the existing behavior: update compact
+  state, append to `closeouts.jsonl`, and include it in conversational history.
+  Set it to `workbench` for an agentic handoff. Workbench closeouts are archived
+  without changing compact state, the JSONL conversation mirror, recent session
+  history, semantic exchange anchors, or conversation search results. Existing
+  rows receive the safe `conversation` default when the additive schema
+  migration runs.
+- `GET /profiles/{id}/closeouts/workbench?since=<unix>&until=<unix>&cursor=<opaque>&limit=20`
+  → `{items, next_cursor}`. Requires `search`; only that profile's workbench
+  closeouts are returned. `since` is inclusive, `until` exclusive, and `cursor`
+  is the `next_cursor` from the prior page. Pages are stably ordered by
+  `created_at DESC, id DESC`; `limit` is 1–100. This read path is intended for
+  later sleep consolidation and never returns conversation closeouts.
   **Compaction boundary:** the backend does not summarize. The *caller*
   (the assistant/model running the session) produces the compact state from
   those fields; the backend only validates and stores it verbatim. `texture`
@@ -163,7 +176,7 @@ belong as a structured dynamic-store record.
   chronological `{texture, exchange}` anchors from recent closeouts. This is
   a bounded few-shot continuity aid, not a closeout-history export.
 - `POST /profiles/{id}/session` also includes `recent_session_log`: the five
-  newest `{date, summary, notes}` chronological handoffs, newest first, projected
+  newest conversational `{date, summary, notes}` handoffs, newest first, projected
   directly from the canonical closeout rows. Existing
   `<profile>_session_log` dynamic-store rows remain
   visible during migration; session logs stay distinct from memories and

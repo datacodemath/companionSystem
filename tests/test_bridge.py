@@ -152,6 +152,7 @@ def test_no_tool_bypasses_api_authorization(tmp_path):
         "delete_file": {"profile_id": "tara", "filename": "f.txt"},
         "search_memories": {"profile_id": "tara", "query": "x"},
         "search_context": {"profile_id": "tara", "query": "x"},
+        "list_workbench_closeouts": {"profile_id": "tara", "since": 1.0},
         "prepare_closeout": {"profile_id": "tara"},
         "closeout": {"profile_id": "tara", "facts": "s", "texture": "t", "exchange": "User: s."},
         "propose_store": {"profile_id": "tara", "name": "n1", "purpose": "p",

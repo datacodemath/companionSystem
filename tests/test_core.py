@@ -305,8 +305,8 @@ def _closeout_runner(store, tmp_path):
         def prepare_closeout(self, profile_id):
             return {"instructions": ["do the thing"]}
 
-        def closeout(self, profile_id, facts, texture, exchange, notes=""):
-            return store.closeout(profile_id, facts, texture, exchange, notes)
+        def closeout(self, profile_id, facts, texture, exchange, notes="", closeout_type="conversation"):
+            return store.closeout(profile_id, facts, texture, exchange, notes, closeout_type)
 
     runner = MCPToolRunner(
         _DirectBridge(),

@@ -67,6 +67,7 @@ from .tool_schemas import (
     QUESTION_REVISION,
     QUESTION_WEAKNESS_REPORT,
     START_SESSION,
+    WORKBENCH_CLOSEOUT_PAGE,
     array_of,
 )
 
@@ -128,6 +129,7 @@ BRIDGE_OUTPUT_SCHEMAS = {
     "roll_ironsworn_dice": IRONSWORN_DICE,
     "delete_file": DELETED_FILE,
     "closeout": CLOSEOUT,
+    "list_workbench_closeouts": WORKBENCH_CLOSEOUT_PAGE,
     "prepare_closeout": PREPARE_CLOSEOUT,
     "propose_store": DYNAMIC_STORE,
     "update_pending_store": DYNAMIC_STORE,
@@ -199,6 +201,14 @@ TOOLS = [
           {"profile_id": _PID, "query": {"type": "string"},
            "limit": {"type": "integer", "default": 20}},
           ["profile_id", "query"]),
+    _tool("list_workbench_closeouts", "List non-conversational workbench closeouts for later sleep consolidation. "
+          "Results are profile-scoped, time-bounded, and cursor-paginated; ordinary conversation history is excluded.",
+          {"profile_id": _PID,
+           "since": {"type": "number", "description": "Inclusive Unix timestamp lower bound."},
+           "until": {"type": "number", "description": "Exclusive Unix timestamp upper bound."},
+           "cursor": {"type": "string", "maxLength": 512, "description": "Opaque next_cursor returned by the prior page."},
+           "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20}},
+          ["profile_id"]),
     _tool("update_memory", "Revise one of your own memory events (kind/content/tags)."
                           " Self-service — no approval needed, same as remembering one.",
           {"profile_id": _PID,
@@ -578,10 +588,26 @@ class ToolBridge:
         return {"deleted": True, "filename": filename}
 
     def closeout(self, profile_id: str, facts: str, texture: str, exchange: str,
-                 notes: str = ""):
+                 notes: str = "", closeout_type: str = "conversation"):
         return self._request("POST", f"/profiles/{profile_id}/closeout",
                              json={"facts": facts, "texture": texture,
-                                   "exchange": exchange, "notes": notes})
+                                   "exchange": exchange, "notes": notes,
+                                   "closeout_type": closeout_type})
+
+    def list_workbench_closeouts(
+        self, profile_id: str, *, since: float | None = None,
+        until: float | None = None, cursor: str | None = None,
+        limit: int = 20,
+    ):
+        params = {"limit": limit}
+        if since is not None:
+            params["since"] = since
+        if until is not None:
+            params["until"] = until
+        if cursor is not None:
+            params["cursor"] = cursor
+        return self._request(
+            "GET", f"/profiles/{profile_id}/closeouts/workbench", params=params)
 
     def prepare_closeout(self, profile_id: str):
         return self._request("POST", f"/profiles/{profile_id}/closeout/prepare")
